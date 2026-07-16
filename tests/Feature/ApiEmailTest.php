@@ -10,9 +10,11 @@ use App\Models\User;
 use App\Models\Workspace;
 use App\Services\Providers\EmailProviderFactory;
 use App\Services\SesV2Client;
+use App\Services\ThreadResolver;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 
 function larasendProjectFixture(): array
 {
@@ -76,6 +78,108 @@ it('sends an email with api key auth and stores searchable content', function ()
         ->and($email->events()->where('event_type', 'send')->exists())->toBeFalse();
 
     Queue::assertPushed(SendQueuedEmail::class, fn (SendQueuedEmail $job) => $job->emailId === $email->id);
+});
+
+it('stores outbound mime on the configured default disk', function () {
+    [, , , $token] = larasendProjectFixture();
+
+    config(['filesystems.default' => 'cloud-test']);
+    Storage::fake('cloud-test');
+    Queue::fake();
+
+    $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'Larasend <receipts@example.com>',
+        'to' => ['Maya <maya@example.com>'],
+        'subject' => 'Durable storage',
+        'text' => 'Stored outside the app instance.',
+    ])->assertAccepted();
+
+    $email = Email::query()->firstOrFail();
+
+    expect($email->mime_disk)->toBe('cloud-test');
+    Storage::disk('cloud-test')->assertExists($email->mime_path);
+
+    $this->app->bind(SesV2Client::class, fn () => new class extends SesV2Client
+    {
+        public function sendRawEmail(Source $source, string $mime, array $destination = []): array
+        {
+            expect($mime)->toContain('Durable storage');
+
+            return ['message_id' => 'ses-durable-1', 'response' => ['MessageId' => 'ses-durable-1']];
+        }
+    });
+
+    (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class));
+
+    expect($email->fresh()->status)->toBe('sent');
+});
+
+it('does not queue or persist outbound email when mime storage fails', function () {
+    [, , , $token] = larasendProjectFixture();
+
+    Queue::fake();
+    Storage::shouldReceive('getDefaultDriver')->andReturn('failing');
+    Storage::shouldReceive('disk')->with('failing')->andReturnSelf();
+    Storage::shouldReceive('put')->andReturnFalse();
+
+    $this->withoutExceptionHandling();
+
+    expect(fn () => $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'Larasend <receipts@example.com>',
+        'to' => ['Maya <maya@example.com>'],
+        'subject' => 'Storage unavailable',
+        'text' => 'This must not be queued.',
+    ]))->toThrow(RuntimeException::class, 'Unable to store outbound MIME content.');
+
+    expect(Email::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('rate limits each api key independently', function () {
+    [, $project, $source, $token] = larasendProjectFixture();
+    $secondToken = ApiKey::issue($project, 'Second key', $source)['plain_text'];
+
+    config(['larasend.api_rate_limit_per_minute' => 2]);
+
+    $this->withToken($token)->getJson('/api/emails')->assertSuccessful();
+    $this->withToken($token)->getJson('/api/emails')->assertSuccessful();
+    $this->withToken($token)->getJson('/api/emails')->assertTooManyRequests();
+
+    $this->withToken($secondToken)->getJson('/api/emails')->assertSuccessful();
+});
+
+it('rate limits unauthenticated api attempts before authentication', function () {
+    config(['larasend.api_auth_rate_limit_per_minute' => 2]);
+
+    $this->getJson('/api/emails')->assertUnauthorized();
+    $this->getJson('/api/emails')->assertUnauthorized();
+    $this->getJson('/api/emails')->assertTooManyRequests();
+});
+
+it('deletes outbound mime when downstream persistence fails', function () {
+    [, , , $token] = larasendProjectFixture();
+
+    config(['filesystems.default' => 'cloud-test']);
+    Storage::fake('cloud-test');
+    Queue::fake();
+
+    $this->mock(ThreadResolver::class)
+        ->shouldReceive('attachOutbound')
+        ->once()
+        ->andThrow(new RuntimeException('Thread persistence failed.'));
+
+    $this->withoutExceptionHandling();
+
+    expect(fn () => $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'Larasend <receipts@example.com>',
+        'to' => ['Maya <maya@example.com>'],
+        'subject' => 'Cleanup storage',
+        'text' => 'Delete this if persistence fails.',
+    ]))->toThrow(RuntimeException::class, 'Thread persistence failed.');
+
+    Storage::disk('cloud-test')->assertDirectoryEmpty('/');
+    expect(Email::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
 });
 
 it('refreshes stale ses quota before accepting api sends', function () {

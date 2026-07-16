@@ -1,6 +1,8 @@
 <?php
 
 return [
+    'api_auth_rate_limit_per_minute' => (int) env('LARASEND_API_AUTH_RATE_LIMIT', 60),
+    'api_rate_limit_per_minute' => (int) env('LARASEND_API_RATE_LIMIT', 120),
 
     /*
     |--------------------------------------------------------------------------

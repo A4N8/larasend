@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Date;
 /**
  * Heartbeats for the two background processes a self-hosted install silently
  * depends on. The queue worker stamps on every poll loop; the scheduler
- * stamps every minute. "Not detected" here is the difference between a
+ * stamps every ten minutes. "Not detected" here is the difference between a
  * mystery ("my email is stuck at queued") and a fix ("run queue:work").
  */
 class SystemHealth
@@ -26,7 +26,7 @@ class SystemHealth
 
     public function recordSchedulerHeartbeat(): void
     {
-        Cache::put(self::SCHEDULER_HEARTBEAT_KEY, now()->toIso8601String(), 600);
+        Cache::put(self::SCHEDULER_HEARTBEAT_KEY, now()->toIso8601String(), 1200);
     }
 
     public function workerHeartbeatAt(): ?CarbonInterface
@@ -46,7 +46,7 @@ class SystemHealth
 
     public function schedulerIsAlive(): bool
     {
-        return $this->schedulerHeartbeatAt()?->greaterThan(now()->subSeconds(180)) === true;
+        return $this->schedulerHeartbeatAt()?->greaterThan(now()->subMinutes(12)) === true;
     }
 
     /**

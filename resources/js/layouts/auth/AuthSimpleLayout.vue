@@ -25,9 +25,7 @@ defineProps<{
                         <div
                             class="flex h-9 w-9 items-center justify-center rounded-md bg-teal-300 text-zinc-950"
                         >
-                            <AppLogoIcon
-                                class="size-5 fill-current"
-                            />
+                            <AppLogoIcon class="size-5 fill-current" />
                         </div>
                         <span class="text-sm font-semibold tracking-tight"
                             >Larasend</span

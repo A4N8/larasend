@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { Link, usePage } from '@inertiajs/vue3';
-import { Activity, KeyRound, Palette, ShieldCheck, UserRound } from 'lucide-vue-next';
+import {
+    Activity,
+    KeyRound,
+    Palette,
+    ShieldCheck,
+    UserRound,
+} from 'lucide-vue-next';
 import { computed } from 'vue';
 import AppLogoIcon from '@/components/AppLogoIcon.vue';
 import { Toaster } from '@/components/ui/sonner';

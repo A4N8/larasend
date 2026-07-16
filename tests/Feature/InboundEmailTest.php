@@ -7,8 +7,10 @@ use App\Models\Source;
 use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
+use App\Services\ThreadResolver;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 
 function inboundProjectFixture(): array
 {
@@ -79,6 +81,66 @@ it('ingests inbound email posted by the cloudflare worker', function () {
         ->and($inbound->mime_size)->toBeGreaterThan(0);
 
     Queue::assertPushed(DeliverInboundWebhook::class);
+});
+
+it('stores inbound mime on the configured default disk', function () {
+    [, , , $source] = inboundProjectFixture();
+
+    config(['filesystems.default' => 'cloud-test']);
+    Storage::fake('cloud-test');
+    Queue::fake();
+
+    $this->postJson("/api/webhooks/inbound/cloudflare/{$source->webhook_token}", [
+        'from' => 'maya@customer.test',
+        'to' => 'support@example.com',
+        'raw' => base64_encode(sampleInboundMime()),
+    ])->assertStatus(202);
+
+    $inbound = InboundEmail::query()->firstOrFail();
+
+    expect($inbound->mime_disk)->toBe('cloud-test');
+    Storage::disk('cloud-test')->assertExists($inbound->mime_path);
+});
+
+it('does not persist inbound email when mime storage fails', function () {
+    [, , , $source] = inboundProjectFixture();
+
+    Queue::fake();
+    Storage::shouldReceive('getDefaultDriver')->andReturn('failing');
+    Storage::shouldReceive('disk')->with('failing')->andReturnSelf();
+    Storage::shouldReceive('put')->andReturnFalse();
+
+    $this->postJson("/api/webhooks/inbound/cloudflare/{$source->webhook_token}", [
+        'from' => 'maya@customer.test',
+        'to' => 'support@example.com',
+        'raw' => base64_encode(sampleInboundMime()),
+    ])->assertServerError();
+
+    expect(InboundEmail::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('deletes inbound mime and rolls back persistence when threading fails', function () {
+    [, , , $source] = inboundProjectFixture();
+
+    config(['filesystems.default' => 'cloud-test']);
+    Storage::fake('cloud-test');
+    Queue::fake();
+
+    $this->mock(ThreadResolver::class)
+        ->shouldReceive('attachInbound')
+        ->once()
+        ->andThrow(new RuntimeException('Thread persistence failed.'));
+
+    $this->postJson("/api/webhooks/inbound/cloudflare/{$source->webhook_token}", [
+        'from' => 'maya@customer.test',
+        'to' => 'support@example.com',
+        'raw' => base64_encode(sampleInboundMime()),
+    ])->assertServerError();
+
+    expect(Storage::disk('cloud-test')->allFiles())->toBe([]);
+    expect(InboundEmail::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
 });
 
 it('rejects inbound posts with an unknown token or wrong provider', function () {

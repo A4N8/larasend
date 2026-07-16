@@ -3,6 +3,7 @@
 use App\Models\User;
 use App\Support\ProjectContext;
 use App\Support\SystemHealth;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Cache;
 
 it('reports worker and scheduler heartbeats through the activity page', function () {
@@ -43,10 +44,27 @@ it('counts emails stuck in queued state when no worker runs', function () {
 
 it('treats stale heartbeats as not alive', function () {
     Cache::put(SystemHealth::WORKER_HEARTBEAT_KEY, now()->subMinutes(10)->toIso8601String(), 600);
-    Cache::put(SystemHealth::SCHEDULER_HEARTBEAT_KEY, now()->subMinute()->toIso8601String(), 600);
+    Cache::put(SystemHealth::SCHEDULER_HEARTBEAT_KEY, now()->subMinutes(9)->toIso8601String(), 1200);
 
     expect(app(SystemHealth::class)->workerIsAlive())->toBeFalse()
         ->and(app(SystemHealth::class)->schedulerIsAlive())->toBeTrue();
+});
+
+it('allows the app to hibernate between scheduler heartbeats', function () {
+    $heartbeat = collect(app(Schedule::class)->events())
+        ->first(fn ($event) => $event->description === 'scheduler-heartbeat');
+
+    expect($heartbeat)->not->toBeNull()
+        ->and($heartbeat->expression)->toBe('*/10 * * * *');
+
+    Cache::put(SystemHealth::SCHEDULER_HEARTBEAT_KEY, now()->subMinutes(13)->toIso8601String(), 1200);
+
+    expect(app(SystemHealth::class)->schedulerIsAlive())->toBeFalse();
+});
+
+it('keeps the durable queue retry window above the longest job timeout', function () {
+    expect(config('queue.connections.database.retry_after'))->toBeGreaterThan(120)
+        ->and(config('queue.connections.redis.retry_after'))->toBeGreaterThan(120);
 });
 
 it('runs the doctor command and reports failures with fixes', function () {

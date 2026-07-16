@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use RuntimeException;
 use Throwable;
 
 class EmailSendService
@@ -52,55 +53,75 @@ class EmailSendService
             );
 
             $mimePath = "emails/{$project->id}/{$publicId}.eml";
-            Storage::disk('local')->put($mimePath, $mime);
-            $fromAddress = $this->mimeBuilder->splitAddress($from);
+            $mimeDisk = Storage::getDefaultDriver();
 
-            $email = Email::create([
-                'public_id' => $publicId,
-                'workspace_id' => $project->workspace_id,
-                'project_id' => $project->id,
-                'source_id' => $source->id,
-                'template_id' => $template?->id,
-                'environment' => $source->environment,
-                'status' => 'queued',
-                'from_email' => $fromAddress['email'],
-                'from_name' => $fromAddress['name'],
-                'subject' => $payload['subject'],
-                'html' => $payload['html'] ?? null,
-                'text' => $payload['text'] ?? null,
-                'mime_disk' => 'local',
-                'mime_path' => $mimePath,
-                'mime_size' => strlen($mime),
-                'headers' => $payload['headers'] ?? [],
-                'tags' => $payload['tags'] ?? [],
-            ]);
+            if (! Storage::disk($mimeDisk)->put($mimePath, $mime)) {
+                throw new RuntimeException('Unable to store outbound MIME content.');
+            }
 
-            foreach (['to', 'cc', 'bcc'] as $type) {
-                foreach ($payload[$type] ?? [] as $recipient) {
-                    $address = $this->mimeBuilder->splitAddress($recipient);
-                    $email->recipients()->create([
-                        'type' => $type,
-                        'email' => $address['email'],
-                        'name' => $address['name'],
+            try {
+                $fromAddress = $this->mimeBuilder->splitAddress($from);
+
+                $email = Email::create([
+                    'public_id' => $publicId,
+                    'workspace_id' => $project->workspace_id,
+                    'project_id' => $project->id,
+                    'source_id' => $source->id,
+                    'template_id' => $template?->id,
+                    'environment' => $source->environment,
+                    'status' => 'queued',
+                    'from_email' => $fromAddress['email'],
+                    'from_name' => $fromAddress['name'],
+                    'subject' => $payload['subject'],
+                    'html' => $payload['html'] ?? null,
+                    'text' => $payload['text'] ?? null,
+                    'mime_disk' => $mimeDisk,
+                    'mime_path' => $mimePath,
+                    'mime_size' => strlen($mime),
+                    'headers' => $payload['headers'] ?? [],
+                    'tags' => $payload['tags'] ?? [],
+                ]);
+
+                foreach (['to', 'cc', 'bcc'] as $type) {
+                    foreach ($payload[$type] ?? [] as $recipient) {
+                        $address = $this->mimeBuilder->splitAddress($recipient);
+                        $email->recipients()->create([
+                            'type' => $type,
+                            'email' => $address['email'],
+                            'name' => $address['name'],
+                        ]);
+                    }
+                }
+
+                foreach ($payload['attachments'] ?? [] as $attachment) {
+                    $email->attachments()->create([
+                        'filename' => $attachment['filename'],
+                        'content_type' => $attachment['content_type'] ?? 'application/octet-stream',
+                        'size' => strlen(base64_decode($attachment['content'], strict: true) ?: ''),
                     ]);
                 }
+
+                $this->threads->attachOutbound($email);
+
+                EmailActivityUpdated::dispatch($email);
+                SendQueuedEmail::dispatch($email->id)->afterCommit();
+
+                return $email->load(['recipients', 'events', 'attachments', 'source', 'template']);
+            } catch (Throwable $exception) {
+                $this->deleteStoredMime($mimeDisk, $mimePath);
+
+                throw $exception;
             }
-
-            foreach ($payload['attachments'] ?? [] as $attachment) {
-                $email->attachments()->create([
-                    'filename' => $attachment['filename'],
-                    'content_type' => $attachment['content_type'] ?? 'application/octet-stream',
-                    'size' => strlen(base64_decode($attachment['content'], strict: true) ?: ''),
-                ]);
-            }
-
-            $this->threads->attachOutbound($email);
-
-            EmailActivityUpdated::dispatch($email);
-            SendQueuedEmail::dispatch($email->id)->afterCommit();
-
-            return $email->load(['recipients', 'events', 'attachments', 'source', 'template']);
         });
+    }
+
+    private function deleteStoredMime(string $disk, string $path): void
+    {
+        try {
+            Storage::disk($disk)->delete($path);
+        } catch (Throwable $exception) {
+            report($exception);
+        }
     }
 
     /**

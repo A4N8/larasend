@@ -13,7 +13,7 @@ Artisan::command('inspire', function () {
 })->purpose('Display an inspiring quote');
 
 Schedule::call(fn () => app(SystemHealth::class)->recordSchedulerHeartbeat())
-    ->everyMinute()
+    ->everyTenMinutes()
     ->name('scheduler-heartbeat');
 Schedule::job(new SyncCloudflareSuppressions)->hourly();
 Schedule::job(new RecheckPendingDomains)->everyTenMinutes()->withoutOverlapping();

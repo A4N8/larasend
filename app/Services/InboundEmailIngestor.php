@@ -5,8 +5,11 @@ namespace App\Services;
 use App\Jobs\DeliverInboundWebhook;
 use App\Models\InboundEmail;
 use App\Models\Source;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use RuntimeException;
+use Throwable;
 use ZBateson\MailMimeParser\Header\HeaderConsts;
 use ZBateson\MailMimeParser\IMessage;
 use ZBateson\MailMimeParser\MailMimeParser;
@@ -30,36 +33,57 @@ class InboundEmailIngestor
         $publicId = 'inbound_'.Str::random(24);
 
         $mimePath = "inbound/{$project->id}/{$publicId}.eml";
-        Storage::disk('local')->put($mimePath, $mime);
+        $mimeDisk = Storage::getDefaultDriver();
 
-        $message = $this->parser->parse($mime, autoClose: true);
+        if (! Storage::disk($mimeDisk)->put($mimePath, $mime)) {
+            throw new RuntimeException('Unable to store inbound MIME content.');
+        }
 
-        $inbound = InboundEmail::create([
-            'public_id' => $publicId,
-            'workspace_id' => $project->workspace_id,
-            'project_id' => $project->id,
-            'source_id' => $source->id,
-            'from_email' => $this->headerAddress($message) ?? $envelopeFrom,
-            'from_name' => $message->getHeader(HeaderConsts::FROM)?->getPersonName() ?: null,
-            'to_email' => $envelopeTo,
-            'subject' => $message->getSubject(),
-            'text' => $message->getTextContent(),
-            'html' => $message->getHtmlContent(),
-            'headers' => $this->interestingHeaders($message),
-            'attachments' => $this->attachmentMetadata($message),
-            'message_id' => trim((string) $message->getHeaderValue(HeaderConsts::MESSAGE_ID), '<>') ?: null,
-            'in_reply_to' => trim((string) $message->getHeaderValue(HeaderConsts::IN_REPLY_TO), '<>') ?: null,
-            'mime_disk' => 'local',
-            'mime_path' => $mimePath,
-            'mime_size' => strlen($mime),
-            'received_at' => now(),
-        ]);
+        try {
+            $message = $this->parser->parse($mime, autoClose: true);
 
-        $this->threads->attachInbound($inbound);
+            return DB::transaction(function () use ($source, $project, $publicId, $envelopeFrom, $envelopeTo, $mime, $mimeDisk, $mimePath, $message): InboundEmail {
+                $inbound = InboundEmail::create([
+                    'public_id' => $publicId,
+                    'workspace_id' => $project->workspace_id,
+                    'project_id' => $project->id,
+                    'source_id' => $source->id,
+                    'from_email' => $this->headerAddress($message) ?? $envelopeFrom,
+                    'from_name' => $message->getHeader(HeaderConsts::FROM)?->getPersonName() ?: null,
+                    'to_email' => $envelopeTo,
+                    'subject' => $message->getSubject(),
+                    'text' => $message->getTextContent(),
+                    'html' => $message->getHtmlContent(),
+                    'headers' => $this->interestingHeaders($message),
+                    'attachments' => $this->attachmentMetadata($message),
+                    'message_id' => trim((string) $message->getHeaderValue(HeaderConsts::MESSAGE_ID), '<>') ?: null,
+                    'in_reply_to' => trim((string) $message->getHeaderValue(HeaderConsts::IN_REPLY_TO), '<>') ?: null,
+                    'mime_disk' => $mimeDisk,
+                    'mime_path' => $mimePath,
+                    'mime_size' => strlen($mime),
+                    'received_at' => now(),
+                ]);
 
-        DeliverInboundWebhook::dispatch($inbound->id)->onQueue('webhooks');
+                $this->threads->attachInbound($inbound);
 
-        return $inbound;
+                DeliverInboundWebhook::dispatch($inbound->id)->onQueue('webhooks')->afterCommit();
+
+                return $inbound;
+            });
+        } catch (Throwable $exception) {
+            $this->deleteStoredMime($mimeDisk, $mimePath);
+
+            throw $exception;
+        }
+    }
+
+    private function deleteStoredMime(string $disk, string $path): void
+    {
+        try {
+            Storage::disk($disk)->delete($path);
+        } catch (Throwable $exception) {
+            report($exception);
+        }
     }
 
     private function headerAddress(IMessage $message): ?string
