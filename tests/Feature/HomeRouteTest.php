@@ -29,3 +29,13 @@ test('home still renders the landing page for signed in users when enabled', fun
         ->assertOk()
         ->assertInertia(fn ($page) => $page->component('Welcome'));
 });
+
+test('responses include baseline browser security headers', function () {
+    $this->get('https://localhost/login')
+        ->assertOk()
+        ->assertHeader('Strict-Transport-Security', 'max-age=31536000')
+        ->assertHeader('X-Frame-Options', 'DENY')
+        ->assertHeader('X-Content-Type-Options', 'nosniff')
+        ->assertHeader('Referrer-Policy', 'same-origin')
+        ->assertHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+});
