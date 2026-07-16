@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\DeliverWebhook;
 use App\Models\Email;
 use App\Models\Project;
 use App\Models\Source;
@@ -7,7 +8,9 @@ use App\Models\User;
 use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
+use App\Services\WebhookDeliveryService;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 
 function outboundWebhookFixture(): array
 {
@@ -31,6 +34,24 @@ function outboundWebhookFixture(): array
 
     return [$project, $source, $email];
 }
+
+it('dispatches outbound webhooks on the default queue', function () {
+    [$project, $source, $email] = outboundWebhookFixture();
+    WebhookEndpoint::issue($project, 'https://example.com/webhooks/larasend', ['delivery']);
+    $event = $email->events()->create([
+        'source_id' => $source->id,
+        'event_type' => 'delivery',
+        'ses_message_id' => $email->ses_message_id,
+        'payload' => [],
+        'occurred_at' => now(),
+    ]);
+
+    Queue::fake();
+
+    app(WebhookDeliveryService::class)->dispatchFor($event);
+
+    Queue::assertPushed(DeliverWebhook::class, fn (DeliverWebhook $job) => $job->queue === null);
+});
 
 it('delivers normalized ses events to active matching webhook endpoints', function () {
     [$project, $source, $email] = outboundWebhookFixture();

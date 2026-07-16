@@ -66,7 +66,7 @@ class InboundEmailIngestor
 
                 $this->threads->attachInbound($inbound);
 
-                DeliverInboundWebhook::dispatch($inbound->id)->onQueue('webhooks')->afterCommit();
+                DeliverInboundWebhook::dispatch($inbound->id)->afterCommit();
 
                 return $inbound;
             });

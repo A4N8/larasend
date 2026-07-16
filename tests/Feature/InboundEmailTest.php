@@ -80,7 +80,7 @@ it('ingests inbound email posted by the cloudflare worker', function () {
         ->and($inbound->in_reply_to)->toBe('thread-99@example.com')
         ->and($inbound->mime_size)->toBeGreaterThan(0);
 
-    Queue::assertPushed(DeliverInboundWebhook::class);
+    Queue::assertPushed(DeliverInboundWebhook::class, fn (DeliverInboundWebhook $job) => $job->queue === null);
 });
 
 it('stores inbound mime on the configured default disk', function () {

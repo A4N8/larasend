@@ -20,7 +20,7 @@ class WebhookDeliveryService
             ->where('status', 'active')
             ->whereJsonContains('events', $event->event_type)
             ->each(function ($endpoint) use ($event): void {
-                DeliverWebhook::dispatch($endpoint->id, $event->id)->onQueue('webhooks');
+                DeliverWebhook::dispatch($endpoint->id, $event->id);
             });
     }
 }
