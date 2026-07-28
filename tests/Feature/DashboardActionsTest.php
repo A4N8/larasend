@@ -643,7 +643,7 @@ it('resends stored emails from project scoped activity routes', function () {
 
     $this->actingAs($user)
         ->post("/projects/{$project->slug}/send", [
-            'from' => 'Larasend <receipts@example.com>',
+            'from' => 'receipts@example.com',
             'to' => 'maya@example.com',
             'subject' => 'Project scoped resend',
             'html' => '<p>Original</p>',

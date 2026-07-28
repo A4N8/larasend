@@ -71,7 +71,7 @@ class MimeMessageBuilder
 
     public function address(string $value): Address
     {
-        if (preg_match('/^(?<name>.+?)\s*<(?<email>[^>]+)>$/', $value, $matches) === 1) {
+        if (preg_match('/^(?<name>.*?)\s*<(?<email>[^>]+)>$/', $value, $matches) === 1) {
             return new Address(trim($matches['email']), trim($matches['name'], " \t\n\r\0\x0B\""));
         }
 
