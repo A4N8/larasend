@@ -98,6 +98,7 @@ class EmailSendService
                         'filename' => $attachment['filename'],
                         'content_type' => $attachment['content_type'] ?? 'application/octet-stream',
                         'size' => strlen(base64_decode($attachment['content'], strict: true) ?: ''),
+                        'disposition' => isset($attachment['content_id']) ? 'inline' : 'attachment',
                     ]);
                 }
 

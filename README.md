@@ -187,6 +187,19 @@ Supported fields include:
 - `headers` for allowed custom headers
 - `tags` for searchable metadata
 
+Each attachment includes `filename` and base64-encoded `content`, with an optional `content_type`. To embed an image, add a unique `content_id` and reference the exact value from HTML:
+
+```json
+{
+  "html": "<img src=\"cid:logo@example.com\" alt=\"Company logo\">",
+  "attachments": [
+    { "filename": "logo.png", "content": "<base64 image bytes>", "content_type": "image/png", "content_id": "logo@example.com" }
+  ]
+}
+```
+
+Content IDs use an ASCII address such as `logo@example.com`, without angle brackets or a `cid:` prefix, and must be unique within the email and at most 128 characters. Omitting `content_id` or setting it to `null` creates an ordinary attachment. Inline parts retain their original Content-ID in the archived `.eml` file. Dashboard previews display matching stored PNG/JPEG images up to 256 KiB each, 512 KiB total, and 4096 pixels per dimension.
+
 ## Laravel Mail Driver
 
 Until the Laravel package is published to Packagist, install it from GitHub.

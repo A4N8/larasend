@@ -29,6 +29,10 @@ import DashboardPanel from '@/components/DashboardPanel.vue';
 import EmailProviderPanel from '@/components/EmailProviderPanel.vue';
 import GlobalRail from '@/components/GlobalRail.vue';
 import { Toaster } from '@/components/ui/sonner';
+import {
+    refreshEmailSelection,
+    selectEmailPreview,
+} from '@/lib/emailSelection';
 
 type Metric = {
     label: string;
@@ -342,7 +346,7 @@ const buildLabel = computed(() => {
 
     return sha ? `v${version} · ${sha}` : `v${version}`;
 });
-const selected = ref<Partial<EmailDetail> | null>(null);
+const selected = ref<EmailDetail | null>(props.selectedEmail);
 const activeTab = ref<'timeline' | 'preview' | 'headers' | 'metrics'>(
     'preview',
 );
@@ -696,7 +700,6 @@ usePoll(
     {
         only: [
             'emails',
-            'selectedEmail',
             'metrics',
             'bounceMetrics',
             'bounceQueue',
@@ -724,24 +727,19 @@ usePoll(
 );
 
 watch(
-    () => props.emails,
-    (emails) => {
-        if (!selected.value?.id) {
-            selected.value = props.selectedEmail;
-
-            return;
-        }
-
-        const refreshed = emails.find(
-            (email) => email.id === selected.value?.id,
+    () =>
+        [
+            props.emails,
+            props.section,
+            props.filters.q,
+            props.filters.range,
+        ] as const,
+    ([emails, section, query, range], [, oldSection, oldQuery, oldRange]) => {
+        selected.value = refreshEmailSelection(
+            selected.value,
+            emails,
+            section !== oldSection || query !== oldQuery || range !== oldRange,
         );
-
-        if (refreshed) {
-            selected.value = {
-                ...selected.value,
-                ...refreshed,
-            };
-        }
     },
 );
 
@@ -1384,15 +1382,32 @@ function roleLabel(role: WorkspaceMemberRole): string {
 }
 
 function selectEmail(email: EmailRow): void {
-    selected.value = email as EmailDetail;
+    selectEmailPreview(selected, email as EmailDetail, reloadEmailPreview);
     activeTab.value = 'preview';
 }
 
+function reloadEmailPreview(
+    id: string,
+    receive: (detail: EmailDetail | null) => void,
+): void {
+    router.reload({
+        data: { email: id },
+        only: ['selectedEmail'],
+        showProgress: false,
+        onSuccess: (page) =>
+            receive(
+                (page.props.selectedEmail as EmailDetail | null | undefined) ??
+                    null,
+            ),
+    });
+}
+
 function closeInspector(): void {
-    selected.value = null;
+    selectEmailPreview(selected, null, reloadEmailPreview);
 }
 
 function applySearch(): void {
+    selected.value = null;
     router.get(
         sectionPath.value,
         { q: searchQuery.value, range: selectedRange.value },

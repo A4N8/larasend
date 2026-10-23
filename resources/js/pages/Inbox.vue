@@ -28,6 +28,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GlobalRail from '@/components/GlobalRail.vue';
 import RichTextEditor from '@/components/RichTextEditor.vue';
 import { Toaster } from '@/components/ui/sonner';
+import {
+    createInboxBodyRecovery,
+    createInboxBodyRetries,
+    cancelInboxPreviewRequests,
+    inboxBodyHeaders,
+    mergeInboxBodies,
+} from '@/lib/inboxMessageBodies';
 import { inbox as inboxRoute } from '@/routes/projects';
 
 type ThreadRow = {
@@ -56,8 +63,10 @@ type Message = {
     from_email: string;
     to: string;
     subject: string | null;
-    text: string | null;
-    html: string | null;
+    text?: string | null;
+    html?: string | null;
+    body_fingerprint: string;
+    body_retryable?: boolean;
     attachments: {
         filename: string | null;
         content_type: string | null;
@@ -109,6 +118,8 @@ const props = defineProps<{
     pagination: { page: number; has_more: boolean };
     selectedThread:
         | (ThreadRow & {
+              body_scope: string;
+              body_version: string;
               messages: Message[];
               reply_from: string | null;
               active_viewers: { id: number; name: string }[];
@@ -122,6 +133,63 @@ const props = defineProps<{
           })
         | null;
 }>();
+
+let inboxMounted = false;
+let inboxPreviewPending = false;
+let inboxNavigating = false;
+const resolvedThread = ref(props.selectedThread);
+const bodyRecovery = createInboxBodyRecovery();
+const bodyRetries = createInboxBodyRetries();
+const selectedMessages = computed(() => resolvedThread.value?.messages ?? []);
+watch(
+    () => [props.project.slug, props.selectedThread] as const,
+    ([project, incoming], [previousProject]) => {
+        if (
+            project !== previousProject ||
+            incoming?.body_scope !== resolvedThread.value?.body_scope
+        ) {
+            bodyRecovery.reset();
+            bodyRetries.reset();
+        }
+
+        resolvedThread.value = mergeInboxBodies(
+            project === previousProject ? resolvedThread.value : null,
+            incoming,
+        );
+    },
+);
+watch(resolvedThread, restoreMissingInboxBodies, { flush: 'post' });
+
+function restoreMissingInboxBodies(): void {
+    if (
+        !inboxMounted ||
+        inboxPreviewPending ||
+        resolvedThread.value?.body_scope !== props.selectedThread?.body_scope
+    ) {
+        return;
+    }
+
+    bodyRecovery.recover(resolvedThread.value, (headers, finish) => {
+        router.reload({
+            only: ['selectedThread'],
+            headers,
+            showProgress: false,
+            onStart: () => {
+                inboxPreviewPending = true;
+            },
+            onFinish: () => {
+                inboxPreviewPending = false;
+                finish();
+            },
+        });
+    });
+}
+
+function resetInboxBodyRequests(): void {
+    cancelInboxPreviewRequests((options) => router.cancelAll(options));
+    bodyRecovery.reset();
+    bodyRetries.reset();
+}
 
 const isDarkMode = ref(false);
 const isThemeReady = ref(false);
@@ -137,6 +205,7 @@ const showActivity = ref(false);
 const tagInput = ref('');
 const notificationsEnabled = ref(false);
 let searchTimer: ReturnType<typeof window.setTimeout> | null = null;
+let inboxVisit = 0;
 
 const inboxPath = computed(() => inboxRoute.url(props.project.slug));
 
@@ -174,6 +243,8 @@ const hasFilters = computed(() =>
 );
 
 function visitInbox(params: Record<string, string | null>): void {
+    const visit = ++inboxVisit;
+
     if (params.thread === null) {
         mobileThreadOpen.value = false;
     }
@@ -194,10 +265,20 @@ function visitInbox(params: Record<string, string | null>): void {
         }
     }
 
+    stopInboxPoll();
+    inboxNavigating = true;
+    resetInboxBodyRequests();
+    resolvedThread.value = null;
     router.get(inboxPath.value, query, {
         preserveState: true,
         preserveScroll: true,
         showProgress: false,
+        onFinish: () => {
+            if (visit === inboxVisit) {
+                inboxNavigating = false;
+                startInboxPoll();
+            }
+        },
     });
 }
 
@@ -456,6 +537,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 onMounted(() => {
+    inboxMounted = true;
     isDarkMode.value = document.documentElement.classList.contains('dark');
     isThemeReady.value = true;
     themeObserver = new MutationObserver(() => {
@@ -469,18 +551,34 @@ onMounted(() => {
         'thread',
     );
     window.addEventListener('keydown', onKeydown);
+    restoreMissingInboxBodies();
     notificationsEnabled.value =
         localStorage.getItem('larasend:inbox-notifications') === '1';
 });
 onBeforeUnmount(() => {
+    inboxMounted = false;
+    inboxVisit++;
+    bodyRecovery.reset();
     themeObserver?.disconnect();
     window.removeEventListener('keydown', onKeydown);
 });
 
-usePoll(
+const { start: startInboxPoll, stop: stopInboxPoll } = usePoll(
     10000,
     {
         only: ['threads', 'counts', 'addresses', 'selectedThread'],
+        get headers() {
+            return inboxPreviewPending || inboxNavigating
+                ? inboxBodyHeaders(resolvedThread.value, [])
+                : bodyRetries.headers(resolvedThread.value);
+        },
+        onBefore: () => !inboxPreviewPending && !inboxNavigating,
+        onStart: () => {
+            inboxPreviewPending = true;
+        },
+        onFinish: () => {
+            inboxPreviewPending = false;
+        },
         showProgress: false,
     },
     { autoStart: true },
@@ -1609,7 +1707,7 @@ function participantSummary(thread: ThreadRow): string {
 
                 <div class="grid min-h-0 content-start gap-3 overflow-auto p-5">
                     <article
-                        v-for="message in selectedThread.messages"
+                        v-for="message in selectedMessages"
                         :key="message.id"
                         class="mx-auto grid w-full max-w-3xl gap-1.5 rounded-lg border px-4 py-3"
                         :class="
@@ -1664,8 +1762,19 @@ function participantSummary(thread: ThreadRow): string {
                         >
                             to {{ message.to }}
                         </div>
+                        <p
+                            v-if="
+                                message.html === undefined ||
+                                message.text === undefined
+                            "
+                            role="status"
+                            aria-busy="true"
+                            class="text-[13px] text-zinc-500"
+                        >
+                            Loading message…
+                        </p>
                         <iframe
-                            v-if="message.html && isThemeReady"
+                            v-else-if="message.html && isThemeReady"
                             :srcdoc="messageDocument(message.html, isDarkMode)"
                             sandbox="allow-same-origin allow-popups"
                             class="h-6 w-full rounded-md bg-white dark:bg-[#101111]"
