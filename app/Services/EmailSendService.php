@@ -94,10 +94,11 @@ class EmailSendService
                 }
 
                 foreach ($payload['attachments'] ?? [] as $attachment) {
+                    $content = base64_decode($attachment['content'], strict: true);
                     $email->attachments()->create([
                         'filename' => $attachment['filename'],
                         'content_type' => $attachment['content_type'] ?? 'application/octet-stream',
-                        'size' => strlen(base64_decode($attachment['content'], strict: true) ?: ''),
+                        'size' => $content === false ? 0 : strlen($content),
                         'disposition' => isset($attachment['content_id']) ? 'inline' : 'attachment',
                     ]);
                 }

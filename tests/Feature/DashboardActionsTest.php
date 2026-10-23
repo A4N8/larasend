@@ -718,8 +718,11 @@ it('does not queue a broken resend when required archived parts cannot be recove
         $original->forceFill(['status' => 'bounced', 'tags' => ['bounce_type' => 'soft']])->save();
     }
     $url = $action === 'soft bounce' ? '/bounces/retry-soft' : "/emails/{$original->public_id}/resend";
-    $this->actingAs($user)->post($url)
+    $response = $this->actingAs($user)->post($url)
         ->assertRedirect()->assertInertiaFlash('toast.type', 'error');
+    if ($action === 'soft bounce') {
+        $response->assertInertiaFlash('toast.message', 'Retried 0 soft bounces. Could not retry 1 email; no replacement was queued for it.');
+    }
 
     expect(Email::query()->where('subject', $original->subject)->count())->toBe(1);
     Queue::assertPushed(SendQueuedEmail::class, 1);

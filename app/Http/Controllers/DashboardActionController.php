@@ -424,10 +424,15 @@ class DashboardActionController extends Controller
                 }
             });
 
+        $failureMessage = match ($failed) {
+            0 => '',
+            1 => ' Could not retry 1 email; no replacement was queued for it.',
+            default => " Could not retry {$failed} emails; no replacement was queued for them.",
+        };
         Inertia::flash('toast', [
             'type' => $failed > 0 ? 'error' : 'success',
             'message' => ($retried === 1 ? 'Retried 1 soft bounce.' : "Retried {$retried} soft bounces.")
-                .($failed > 0 ? " Could not retry {$failed} emails; no replacement was queued for them." : ''),
+                .$failureMessage,
         ]);
 
         return $this->toProjectSection($project, 'bounces');

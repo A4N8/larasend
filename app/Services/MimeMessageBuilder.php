@@ -60,8 +60,9 @@ class MimeMessageBuilder
         }
 
         foreach ($attachments as $attachment) {
+            $content = base64_decode($attachment['content'], strict: true);
             $part = new DataPart(
-                base64_decode($attachment['content'], strict: true) ?: '',
+                $content === false ? '' : $content,
                 $attachment['filename'],
                 $attachment['content_type'] ?? 'application/octet-stream',
             );

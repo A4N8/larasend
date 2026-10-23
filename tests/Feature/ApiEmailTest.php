@@ -20,6 +20,41 @@ use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use ZBateson\MailMimeParser\MailMimeParser;
 
+it('does not pass internal MIME parameters from API attachment extras to the builder', function (mixed $parameters): void {
+    [, , , $token] = larasendProjectFixture();
+    Queue::fake();
+    Storage::fake('local');
+    Http::preventStrayRequests();
+    $response = $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'receipts@example.com', 'to' => ['maya@example.com'], 'subject' => 'Internal MIME field isolation', 'text' => 'Hello',
+        'attachments' => [['filename' => 'names.csv', 'content' => base64_encode('fictional-data'), 'content_type' => 'text/csv', 'content_type_parameters' => $parameters]],
+    ]);
+    $response->assertAccepted();
+    $email = Email::query()->where('public_id', $response->json('id'))->sole();
+    $mime = app(MailMimeParser::class)->parse(Storage::disk($email->mime_disk)->get($email->mime_path), false);
+    expect($mime->getAllAttachmentParts()[0]->getHeaderParameter('Content-Type', 'charset'))->toBeNull();
+    Queue::assertPushed(SendQueuedEmail::class, 1);
+    Http::assertNothingSent();
+})->with(['invalid type' => ['invalid-internal-value'], 'invalid nested type' => [['charset' => ['invalid']]], 'untrusted charset' => [['charset' => 'ISO-8859-1']]]);
+
+it('preserves an attachment consisting of the single ASCII zero byte through API MIME and metadata', function (): void {
+    [, , , $token] = larasendProjectFixture();
+    Queue::fake();
+    Storage::fake('local');
+    Http::preventStrayRequests();
+    $response = $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'receipts@example.com', 'to' => ['maya@example.com'], 'subject' => 'Single zero byte', 'text' => 'Hello',
+        'attachments' => [['filename' => 'zero.txt', 'content' => base64_encode('0'), 'content_type' => 'text/plain']],
+    ]);
+    $response->assertAccepted();
+    $email = Email::query()->where('public_id', $response->json('id'))->sole();
+    $mime = app(MailMimeParser::class)->parse(Storage::disk($email->mime_disk)->get($email->mime_path), false);
+    expect($mime->getAllAttachmentParts()[0]->getBinaryContentStream()?->getContents())->toBe('0')
+        ->and((int) $email->attachments()->sole()->size)->toBe(1);
+    Queue::assertPushed(SendQueuedEmail::class, 1);
+    Http::assertNothingSent();
+});
+
 function larasendProjectFixture(string $suffix = ''): array
 {
     $user = User::factory()->create();
