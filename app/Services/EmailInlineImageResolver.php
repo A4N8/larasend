@@ -49,7 +49,7 @@ class EmailInlineImageResolver
             $document = HTMLDocument::createFromString($html, LIBXML_NOERROR, 'UTF-8');
             $changed = false;
             foreach ($document->getElementsByTagName('img') as $image) {
-                $source = $image->getAttribute('src');
+                $source = $image->getAttribute('src') ?? '';
                 if ($image->namespaceURI !== 'http://www.w3.org/1999/xhtml' || ! str_starts_with($source, 'cid:')) {
                     continue;
                 }

@@ -16,8 +16,9 @@ beforeEach(function (): void {
 });
 
 it('resolves exact inline raster CIDs from stored MIME without changing the saved HTML', function (): void {
+    $this->withoutDeprecationHandling();
     $png = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=');
-    $html = '<!doctype html><html><head><style>.card{color:navy}</style></head><body><p>Здравейте</p><img src="cid:Logo@email.local" width="120"><img src="cid:logo@email.local"><img src="cid:missing@email.local"><img src="https://tracker.test/logo"></body></html>';
+    $html = '<!doctype html><html><head><style>.card{color:navy}</style></head><body><p>Здравейте</p><img src="cid:Logo@email.local" width="120"><img src="cid:logo@email.local"><img src="cid:missing@email.local"><img src="https://tracker.test/logo"><img alt="No source"></body></html>';
     $mime = (new MimeEmail)->from('from@example.test')->to('to@example.test')->html($html)
         ->addPart((new DataPart($png, 'logo.png', 'image/png'))->asInline()->setContentId('Logo@email.local'))
         ->attach('pdf-bytes', 'invoice.pdf', 'application/pdf')->toString();

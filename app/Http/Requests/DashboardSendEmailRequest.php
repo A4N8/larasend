@@ -37,7 +37,12 @@ class DashboardSendEmailRequest extends SendEmailRequest
     public function rules(): array
     {
         $rules = parent::rules();
-        unset($rules['attachments'], $rules['attachments.*.filename'], $rules['attachments.*.content'], $rules['attachments.*.content_type']);
+        foreach (array_keys($rules) as $field) {
+            if ($field === 'attachments' || str_starts_with($field, 'attachments.')) {
+                unset($rules[$field]);
+            }
+        }
+        $rules['attachments'] = ['prohibited'];
 
         return $rules;
     }

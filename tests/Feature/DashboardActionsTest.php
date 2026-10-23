@@ -7,9 +7,12 @@ use App\Models\Project;
 use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Services\DnsRecordVerifier;
+use App\Services\EmailSendService;
 use App\Support\ProjectContext;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
+use ZBateson\MailMimeParser\MailMimeParser;
 
 beforeEach(function (): void {
     // Domain rechecks dispatched during these tests run inline on the sync
@@ -634,6 +637,94 @@ it('resends stored emails from the inspector action', function () {
 
     Queue::assertPushed(SendQueuedEmail::class, 2);
 });
+
+it('rejects dashboard attachments instead of forwarding partial validated inline parts', function (): void {
+    $user = User::factory()->create();
+    configureDashboardSesSending($user);
+    Queue::fake();
+
+    $this->actingAs($user)->postJson('/send', [
+        'from' => 'receipts@example.com', 'to' => 'maya@example.com',
+        'subject' => 'Unsupported dashboard attachment', 'html' => '<p>Hello</p>',
+        'attachments' => [['filename' => 'logo.png', 'content' => base64_encode('bytes'), 'content_type' => 'image/png', 'content_id' => 'logo@example.com']],
+    ])->assertUnprocessable()->assertJsonValidationErrors('attachments');
+
+    expect(Email::query()->where('subject', 'Unsupported dashboard attachment')->exists())->toBeFalse();
+    Queue::assertNothingPushed();
+    Http::assertNothingSent();
+});
+
+it('preserves archived inline parts and ordinary documents on dashboard resend and soft-bounce retry', function (string $action): void {
+    $user = User::factory()->create();
+    $project = configureDashboardSesSending($user);
+    Storage::fake('local');
+    Queue::fake();
+    $png = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=');
+    $original = app(EmailSendService::class)->send($project, $project->sources()->firstOrFail(), [
+        'from' => 'receipts@example.com', 'to' => ['maya@example.com'],
+        'subject' => 'Archived inline resend', 'html' => '<p>Hello</p><img src="cid:Logo@example.com">', 'text' => 'Hello',
+        'attachments' => [
+            ['filename' => 'logo.png', 'content' => base64_encode($png), 'content_type' => 'image/png', 'content_id' => 'Logo@example.com'],
+            ['filename' => 'statement.pdf', 'content' => base64_encode('original-pdf-bytes'), 'content_type' => 'application/pdf'],
+        ],
+    ]);
+    if ($action === 'soft bounce') {
+        $original->forceFill(['status' => 'bounced', 'tags' => ['bounce_type' => 'soft']])->save();
+    }
+    Storage::fake('new-default');
+    config(['filesystems.default' => 'new-default']);
+    $url = match ($action) {
+        'soft bounce' => '/bounces/retry-soft',
+        'project resend' => "/projects/{$project->slug}/emails/{$original->public_id}/resend",
+        default => "/emails/{$original->public_id}/resend",
+    };
+
+    $this->actingAs($user)->post($url)->assertRedirect();
+
+    $resent = Email::query()->where('subject', $original->subject)->whereKeyNot($original->id)->sole();
+    $mime = app(MailMimeParser::class)->parse(Storage::disk($resent->mime_disk)->get($resent->mime_path), false);
+    $parts = collect($mime->getAllAttachmentParts());
+    $inline = $parts->first(fn ($part) => $part->getContentDisposition() === 'inline');
+    $document = $parts->first(fn ($part) => $part->getFilename() === 'statement.pdf');
+    expect($resent->html)->toBe($original->html)
+        ->and($inline?->getContentId())->toBe('Logo@example.com')
+        ->and($inline?->getContent())->toBe($png)
+        ->and($inline?->getContentType())->toBe('image/png')
+        ->and($document?->getContent())->toBe('original-pdf-bytes')
+        ->and($document?->getContentDisposition())->toBe('attachment')
+        ->and($resent->attachments()->count())->toBe(2);
+    Queue::assertPushed(SendQueuedEmail::class, 2);
+    Http::assertNothingSent();
+})->with(['resend', 'project resend', 'soft bounce']);
+
+it('does not queue a broken resend when required archived parts cannot be recovered', function (string $state, string $action): void {
+    $user = User::factory()->create();
+    $project = configureDashboardSesSending($user);
+    Storage::fake('local');
+    Queue::fake();
+    $original = app(EmailSendService::class)->send($project, $project->sources()->firstOrFail(), [
+        'from' => 'receipts@example.com', 'to' => ['maya@example.com'],
+        'subject' => 'Unavailable inline archive', 'html' => '<img src="cid:logo@example.com">',
+        'attachments' => [['filename' => 'logo.png', 'content' => base64_encode('original-bytes'), 'content_type' => 'image/png', 'content_id' => 'logo@example.com']],
+    ]);
+    if ($state === 'missing') {
+        Storage::disk('local')->delete($original->mime_path);
+    } elseif ($state === 'malformed') {
+        Storage::disk('local')->put($original->mime_path, "Content-Type: text/plain\r\n\r\ntruncated archive");
+    } else {
+        Storage::disk('local')->put($original->mime_path, str_replace('logo@example.com', 'other@example.com', Storage::disk('local')->get($original->mime_path)));
+    }
+    if ($action === 'soft bounce') {
+        $original->forceFill(['status' => 'bounced', 'tags' => ['bounce_type' => 'soft']])->save();
+    }
+    $url = $action === 'soft bounce' ? '/bounces/retry-soft' : "/emails/{$original->public_id}/resend";
+    $this->actingAs($user)->post($url)
+        ->assertRedirect()->assertInertiaFlash('toast.type', 'error');
+
+    expect(Email::query()->where('subject', $original->subject)->count())->toBe(1);
+    Queue::assertPushed(SendQueuedEmail::class, 1);
+    Http::assertNothingSent();
+})->with(['missing', 'malformed', 'wrong content ID'])->with(['resend', 'soft bounce']);
 
 it('resends stored emails from project scoped activity routes', function () {
     $user = User::factory()->create();

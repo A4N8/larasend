@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Middleware\HandleInertiaRequests;
 use App\Jobs\SendQueuedEmail;
 use App\Models\ApiKey;
 use App\Models\Email;
@@ -276,7 +277,7 @@ it('reads MIME only for an authorized selected activity email and skips list or 
 
     $this->actingAs($owner)->get($url)->assertInertia(fn ($page) => $page->has('emails', 50)->where('selectedEmail', null));
     expect($reads)->toBe([]);
-    $this->withHeaders(['X-Inertia' => 'true', 'X-Inertia-Partial-Component' => 'Activity', 'X-Inertia-Partial-Data' => 'selectedEmail'])
+    $this->withHeaders(['X-Inertia' => 'true', 'X-Inertia-Version' => app(HandleInertiaRequests::class)->version(request()) ?? '', 'X-Inertia-Partial-Component' => 'Activity', 'X-Inertia-Partial-Data' => 'selectedEmail'])
         ->get($url.'?email='.$selected->public_id)->assertSuccessful()
         ->assertJsonPath('component', 'Activity')
         ->assertJsonPath('props.selectedEmail.id', $selected->public_id)
@@ -316,7 +317,8 @@ it('omits unchanged inbox bodies from polls and reads only new or changed archiv
     Storage::set('s3', $spy);
     $url = '/projects/'.$project->slug.'/inbox?thread='.$thread->public_id;
     $owner = User::query()->findOrFail($workspace->owner_id);
-    $initial = $this->actingAs($owner)->withHeader('X-Inertia', 'true')->get($url)->assertSuccessful()->json('props.selectedThread');
+    $initial = $this->actingAs($owner)->withHeader('X-Inertia-Version', app(HandleInertiaRequests::class)->version(request()) ?? '')
+        ->withHeader('X-Inertia', 'true')->get($url)->assertSuccessful()->json('props.selectedThread');
     expect($reads)->toHaveCount(2)->and($initial['body_scope'] ?? null)->toBeString();
     $known = collect($initial['messages'])->pluck('body_fingerprint', 'id')->all();
     $headers = ['X-Inertia-Partial-Component' => 'Inbox', 'X-Inertia-Partial-Data' => 'selectedThread',
@@ -385,7 +387,8 @@ it('retries only transiently failed inline previews while retaining healthy bodi
     });
     Storage::set('s3', $spy);
     $url = '/projects/'.$project->slug.'/inbox?thread='.$project->threads()->firstOrFail()->public_id;
-    $initial = $this->actingAs(User::query()->findOrFail($workspace->owner_id))->withHeader('X-Inertia', 'true')
+    $initial = $this->actingAs(User::query()->findOrFail($workspace->owner_id))->withHeader('X-Inertia-Version', app(HandleInertiaRequests::class)->version(request()) ?? '')
+        ->withHeader('X-Inertia', 'true')
         ->get($url)->assertSuccessful()->json('props.selectedThread');
     expect($reads)->toBe(31)->and($initial['messages'][0]['html'])->toBe($payload['html'])
         ->and($initial['messages'][0]['body_retryable'] ?? false)->toBeTrue();
