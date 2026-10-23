@@ -7,6 +7,7 @@ use App\Models\Source;
 use App\Models\User;
 use App\Models\Workspace;
 use App\Support\ProjectContext;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -93,7 +94,7 @@ it('adding a second source for the same project and environment fails after the 
         'name' => 'Duplicate',
         'environment' => 'prod',
         'webhook_token' => (string) Str::uuid(),
-    ]))->toThrow(\Illuminate\Database\QueryException::class);
+    ]))->toThrow(QueryException::class);
 });
 
 it('resolves the same source for api key issuance and dashboard display', function () {
