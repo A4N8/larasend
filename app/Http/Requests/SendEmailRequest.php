@@ -41,6 +41,7 @@ class SendEmailRequest extends FormRequest
             'attachments.*.filename' => ['required_with:attachments', 'string', 'max:255'],
             'attachments.*.content' => ['required_with:attachments', 'string'],
             'attachments.*.content_type' => ['sometimes', 'nullable', 'string', 'max:255'],
+            'attachments.*.content_id' => ['sometimes', 'nullable', 'string', 'max:128', 'regex:/\A[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\z/', 'email:rfc', 'distinct:strict'],
             'headers' => ['sometimes', 'array'],
             'headers.*' => ['string', 'max:998'],
             'tags' => ['sometimes', 'array'],

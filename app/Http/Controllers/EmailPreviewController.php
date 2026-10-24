@@ -3,13 +3,14 @@
 namespace App\Http\Controllers;
 
 use App\Models\Email;
+use App\Services\EmailInlineImageResolver;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
 
 class EmailPreviewController extends Controller
 {
-    public function __invoke(Email $email): Response
+    public function __invoke(Email $email, EmailInlineImageResolver $inlineImages): Response
     {
         abort_unless(
             Auth::user()?->workspaces()->whereKey($email->workspace_id)->exists(),
@@ -19,7 +20,7 @@ class EmailPreviewController extends Controller
         $subject = e($email->subject ?: 'Email preview');
         $from = e(trim(($email->from_name ? $email->from_name.' ' : '').'<'.$email->from_email.'>'));
         $recipients = e($email->recipients()->where('type', 'to')->pluck('email')->join(', '));
-        $body = $email->html ?: $this->textPreview($email->text ?? '');
+        $body = $inlineImages->html($email) ?: $this->textPreview($email->text ?? '');
 
         return response($this->previewDocument($subject, $from, $recipients, $body), 200, [
             'Content-Type' => 'text/html; charset=UTF-8',

@@ -28,6 +28,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GlobalRail from '@/components/GlobalRail.vue';
 import RichTextEditor from '@/components/RichTextEditor.vue';
 import { Toaster } from '@/components/ui/sonner';
+import {
+    createInboxBodyRecovery,
+    createInboxBodyRetries,
+    cancelInboxPreviewRequests,
+    inboxBodyHeaders,
+    mergeInboxBodies,
+} from '@/lib/inboxMessageBodies';
+import { messageDocument } from '@/lib/messageDocument';
 import { inbox as inboxRoute } from '@/routes/projects';
 
 type ThreadRow = {
@@ -56,8 +64,10 @@ type Message = {
     from_email: string;
     to: string;
     subject: string | null;
-    text: string | null;
-    html: string | null;
+    text?: string | null;
+    html?: string | null;
+    body_fingerprint: string;
+    body_retryable?: boolean;
     attachments: {
         filename: string | null;
         content_type: string | null;
@@ -109,6 +119,8 @@ const props = defineProps<{
     pagination: { page: number; has_more: boolean };
     selectedThread:
         | (ThreadRow & {
+              body_scope: string;
+              body_version: string;
               messages: Message[];
               reply_from: string | null;
               active_viewers: { id: number; name: string }[];
@@ -122,6 +134,63 @@ const props = defineProps<{
           })
         | null;
 }>();
+
+let inboxMounted = false;
+let inboxPreviewPending = false;
+let inboxNavigating = false;
+const resolvedThread = ref(props.selectedThread);
+const bodyRecovery = createInboxBodyRecovery();
+const bodyRetries = createInboxBodyRetries();
+const selectedMessages = computed(() => resolvedThread.value?.messages ?? []);
+watch(
+    () => [props.project.slug, props.selectedThread] as const,
+    ([project, incoming], [previousProject]) => {
+        if (
+            project !== previousProject ||
+            incoming?.body_scope !== resolvedThread.value?.body_scope
+        ) {
+            bodyRecovery.reset();
+            bodyRetries.reset();
+        }
+
+        resolvedThread.value = mergeInboxBodies(
+            project === previousProject ? resolvedThread.value : null,
+            incoming,
+        );
+    },
+);
+watch(resolvedThread, restoreMissingInboxBodies, { flush: 'post' });
+
+function restoreMissingInboxBodies(): void {
+    if (
+        !inboxMounted ||
+        inboxPreviewPending ||
+        resolvedThread.value?.body_scope !== props.selectedThread?.body_scope
+    ) {
+        return;
+    }
+
+    bodyRecovery.recover(resolvedThread.value, (headers, finish) => {
+        router.reload({
+            only: ['selectedThread'],
+            headers,
+            showProgress: false,
+            onStart: () => {
+                inboxPreviewPending = true;
+            },
+            onFinish: () => {
+                inboxPreviewPending = false;
+                finish();
+            },
+        });
+    });
+}
+
+function resetInboxBodyRequests(): void {
+    cancelInboxPreviewRequests((options) => router.cancelAll(options));
+    bodyRecovery.reset();
+    bodyRetries.reset();
+}
 
 const isDarkMode = ref(false);
 const isThemeReady = ref(false);
@@ -137,6 +206,7 @@ const showActivity = ref(false);
 const tagInput = ref('');
 const notificationsEnabled = ref(false);
 let searchTimer: ReturnType<typeof window.setTimeout> | null = null;
+let inboxVisit = 0;
 
 const inboxPath = computed(() => inboxRoute.url(props.project.slug));
 
@@ -174,6 +244,8 @@ const hasFilters = computed(() =>
 );
 
 function visitInbox(params: Record<string, string | null>): void {
+    const visit = ++inboxVisit;
+
     if (params.thread === null) {
         mobileThreadOpen.value = false;
     }
@@ -194,10 +266,20 @@ function visitInbox(params: Record<string, string | null>): void {
         }
     }
 
+    stopInboxPoll();
+    inboxNavigating = true;
+    resetInboxBodyRequests();
+    resolvedThread.value = null;
     router.get(inboxPath.value, query, {
         preserveState: true,
         preserveScroll: true,
         showProgress: false,
+        onFinish: () => {
+            if (visit === inboxVisit) {
+                inboxNavigating = false;
+                startInboxPoll();
+            }
+        },
     });
 }
 
@@ -456,6 +538,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 onMounted(() => {
+    inboxMounted = true;
     isDarkMode.value = document.documentElement.classList.contains('dark');
     isThemeReady.value = true;
     themeObserver = new MutationObserver(() => {
@@ -469,18 +552,34 @@ onMounted(() => {
         'thread',
     );
     window.addEventListener('keydown', onKeydown);
+    restoreMissingInboxBodies();
     notificationsEnabled.value =
         localStorage.getItem('larasend:inbox-notifications') === '1';
 });
 onBeforeUnmount(() => {
+    inboxMounted = false;
+    inboxVisit++;
+    bodyRecovery.reset();
     themeObserver?.disconnect();
     window.removeEventListener('keydown', onKeydown);
 });
 
-usePoll(
+const { start: startInboxPoll, stop: stopInboxPoll } = usePoll(
     10000,
     {
         only: ['threads', 'counts', 'addresses', 'selectedThread'],
+        get headers() {
+            return inboxPreviewPending || inboxNavigating
+                ? inboxBodyHeaders(resolvedThread.value, [])
+                : bodyRetries.headers(resolvedThread.value);
+        },
+        onBefore: () => !inboxPreviewPending && !inboxNavigating,
+        onStart: () => {
+            inboxPreviewPending = true;
+        },
+        onFinish: () => {
+            inboxPreviewPending = false;
+        },
         showProgress: false,
     },
     { autoStart: true },
@@ -745,31 +844,6 @@ watch(
 // Message HTML renders inside a sandboxed iframe (no scripts). The wrapper
 // document gives foreign markup native typography; the load handler sizes
 // the frame to its content so short messages stay short.
-function messageDocument(html: string, dark: boolean): string {
-    const safeHtml = html
-        .replace(
-            /<img\b[^>]*>/gi,
-            '<span style="color:#71717a">[remote image blocked]</span>',
-        )
-        .replace(/<a\s/gi, '<a target="_blank" rel="noopener noreferrer" ');
-
-    const foreground = dark ? '#e4e4e7' : '#27272a';
-    const muted = dark ? '#a1a1aa' : '#71717a';
-    const link = dark ? '#5eead4' : '#0d9488';
-
-    return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:"><style>
-html{color-scheme:${dark ? 'dark' : 'light'};background:transparent}
-body{margin:0;padding:1px;background:transparent;font:13px/1.6 ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:${foreground};word-break:break-word;overflow-wrap:anywhere}
-${dark ? `body :where(p,div,span,td,th,li,pre,code,strong,em){color:${foreground}!important}` : ''}
-img{max-width:100%;height:auto}
-p{margin:0 0 .6em}p:last-child{margin-bottom:0}
-ul,ol{margin:0 0 .6em;padding-left:1.4em}
-blockquote{margin:0 0 .6em;padding-left:.8em;border-left:2px solid #99f6e4;color:${muted}}
-pre{white-space:pre-wrap;font:12px/1.6 ui-monospace,monospace}
-a{color:${link}!important}
-table{max-width:100%}
-</style></head><body>${safeHtml}</body></html>`;
-}
 
 function fitMessageFrame(event: Event): void {
     const frame = event.target as HTMLIFrameElement;
@@ -1609,7 +1683,7 @@ function participantSummary(thread: ThreadRow): string {
 
                 <div class="grid min-h-0 content-start gap-3 overflow-auto p-5">
                     <article
-                        v-for="message in selectedThread.messages"
+                        v-for="message in selectedMessages"
                         :key="message.id"
                         class="mx-auto grid w-full max-w-3xl gap-1.5 rounded-lg border px-4 py-3"
                         :class="
@@ -1664,8 +1738,19 @@ function participantSummary(thread: ThreadRow): string {
                         >
                             to {{ message.to }}
                         </div>
+                        <p
+                            v-if="
+                                message.html === undefined ||
+                                message.text === undefined
+                            "
+                            role="status"
+                            aria-busy="true"
+                            class="text-[13px] text-zinc-500"
+                        >
+                            Loading message…
+                        </p>
                         <iframe
-                            v-if="message.html && isThemeReady"
+                            v-else-if="message.html && isThemeReady"
                             :srcdoc="messageDocument(message.html, isDarkMode)"
                             sandbox="allow-same-origin allow-popups"
                             class="h-6 w-full rounded-md bg-white dark:bg-[#101111]"

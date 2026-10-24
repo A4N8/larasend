@@ -11,6 +11,7 @@ use App\Models\Thread;
 use App\Models\User;
 use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
+use App\Services\EmailInlineImageResolver;
 use App\Services\Providers\EmailProviderFactory;
 use App\Support\ProjectContext;
 use App\Support\SystemHealth;
@@ -28,6 +29,7 @@ class ActivityController extends Controller
     public function __construct(
         private EmailProviderFactory $providers,
         private SystemHealth $systemHealth,
+        private EmailInlineImageResolver $inlineImages,
     ) {}
 
     public function __invoke(Request $request, ProjectContext $context): Response|RedirectResponse
@@ -64,7 +66,6 @@ class ActivityController extends Controller
             ->limit(50)
             ->get();
 
-        $selected = $emails->first();
         $canSend = $source ? $this->canSend($project, $source) : false;
 
         return Inertia::render('Activity', [
@@ -120,7 +121,15 @@ class ActivityController extends Controller
             'bounceMetrics' => $this->bounceMetrics($project),
             'bounceQueue' => $this->bounceQueue($project, $request),
             'emails' => $emails->map(fn (Email $email) => $this->serializeEmail($email, detailed: true)),
-            'selectedEmail' => $selected ? $this->serializeEmail($selected, detailed: true) : null,
+            'selectedEmail' => function () use ($project, $request, $section): ?array {
+                $publicId = $request->string('email')->toString();
+                if ($publicId === '') {
+                    return null;
+                }
+                $selected = $this->activityEmailsQuery($project, $request, $section)->where('public_id', $publicId)->first();
+
+                return $selected ? $this->serializeEmail($selected, detailed: true, resolveInlineImages: true) : null;
+            },
             'source' => $source ? [
                 'name' => $source->name,
                 'environment' => $source->environment,
@@ -776,7 +785,7 @@ class ActivityController extends Controller
     /**
      * @return array<string, mixed>
      */
-    private function serializeEmail(Email $email, bool $detailed = false): array
+    private function serializeEmail(Email $email, bool $detailed = false, bool $resolveInlineImages = false): array
     {
         $toRecipients = $email->recipients->where('type', 'to')->values();
         $ccRecipients = $email->recipients->where('type', 'cc')->values();
@@ -805,7 +814,7 @@ class ActivityController extends Controller
                 'to' => $this->formatRecipients($toRecipients),
                 'cc' => $this->formatRecipients($ccRecipients),
                 'bcc' => $this->formatRecipients($bccRecipients),
-                'html' => $email->html,
+                'html' => $resolveInlineImages ? $this->inlineImages->html($email) : $email->html,
                 'text' => $email->text,
                 'headers' => $email->headers,
                 'sesMessageId' => $email->ses_message_id,

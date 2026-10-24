@@ -9,6 +9,7 @@ on:
       - workos
   pull_request:
     branches:
+      - codex/laravel-cloud-deployment
       - develop
       - main
       - master
@@ -38,7 +39,10 @@ jobs:
           node-version: '22'
 
       - name: Install Node Dependencies
-        run: npm i
+        run: npm ci
+
+      - name: Frontend Regression Tests
+        run: node --test resources/js/lib/*.test.mjs
 
       - name: Install Dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader

@@ -18,6 +18,7 @@ use App\Models\Source;
 use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Services\DnsRecordVerifier;
+use App\Services\EmailRetryAttachments;
 use App\Services\EmailSendService;
 use App\Services\Providers\CloudflareInboundProvisioner;
 use App\Services\Providers\DomainOnboardingException;
@@ -370,7 +371,7 @@ class DashboardActionController extends Controller
 
         abort_unless($email->project_id === $project->id, 404);
 
-        $email->load(['recipients', 'source', 'template']);
+        $email->load(['recipients', 'source', 'template', 'attachments']);
 
         if (! $email->source || ! $this->canSend($project, $email->source)) {
             return $this->redirectToSendSetup($project);
@@ -400,24 +401,39 @@ class DashboardActionController extends Controller
         $this->authorizeWorkspaceCapability($project, 'send');
 
         $retried = 0;
+        $failed = 0;
 
         $project->emails()
-            ->with(['recipients', 'events', 'source', 'template'])
+            ->with(['recipients', 'events', 'source', 'template', 'attachments'])
             ->where('status', 'bounced')
             ->latest()
             ->limit(100)
             ->get()
             ->filter(fn (Email $email) => $this->isSoftBounce($email))
-            ->each(function (Email $email) use ($emailSendService, $project, &$retried): void {
+            ->each(function (Email $email) use ($emailSendService, $project, &$retried, &$failed): void {
                 if (! $email->source || ! $this->canSend($project, $email->source)) {
                     return;
                 }
 
-                $emailSendService->send($project, $email->source, $this->payloadForRetry($email));
-                $retried++;
+                try {
+                    $emailSendService->send($project, $email->source, $this->payloadForRetry($email));
+                    $retried++;
+                } catch (Throwable $exception) {
+                    report($exception);
+                    $failed++;
+                }
             });
 
-        Inertia::flash('toast', ['type' => 'success', 'message' => $retried === 1 ? 'Retried 1 soft bounce.' : "Retried {$retried} soft bounces."]);
+        $failureMessage = match ($failed) {
+            0 => '',
+            1 => ' Could not retry 1 email; no replacement was queued for it.',
+            default => " Could not retry {$failed} emails; no replacement was queued for them.",
+        };
+        Inertia::flash('toast', [
+            'type' => $failed > 0 ? 'error' : 'success',
+            'message' => ($retried === 1 ? 'Retried 1 soft bounce.' : "Retried {$retried} soft bounces.")
+                .$failureMessage,
+        ]);
 
         return $this->toProjectSection($project, 'bounces');
     }
@@ -603,6 +619,7 @@ class DashboardActionController extends Controller
             'subject' => $email->subject,
             'html' => $email->html,
             'text' => $email->text,
+            'attachments' => app(EmailRetryAttachments::class)->forEmail($email),
             'headers' => $email->headers ?? [],
             'tags' => array_merge($email->tags ?? [], ['resent_from' => $email->public_id]),
         ];

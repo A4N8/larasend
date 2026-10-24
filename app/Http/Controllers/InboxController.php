@@ -8,6 +8,7 @@ use App\Models\Project;
 use App\Models\Thread;
 use App\Models\ThreadNote;
 use App\Models\User;
+use App\Services\EmailInlineImageResolver;
 use App\Support\ProjectContext;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
@@ -18,6 +19,8 @@ use Inertia\Response;
 
 class InboxController extends Controller
 {
+    public function __construct(private EmailInlineImageResolver $inlineImages) {}
+
     public function __invoke(Request $request, ProjectContext $context): Response
     {
         $user = $request->user();
@@ -80,9 +83,9 @@ class InboxController extends Controller
             ],
             'threads' => $threads->take(50)->map(fn (Thread $thread): array => $this->serializeThread($thread, $user->id)),
             'pagination' => ['page' => $page, 'has_more' => $threads->count() > 50],
-            'selectedThread' => $selected ? [
+            'selectedThread' => fn () => $selected ? [
                 ...$this->serializeThread($selected, $user->id),
-                'messages' => $this->messagesFor($selected),
+                ...$this->messagesFor($selected, $request),
                 'reply_from' => $this->replyFromFor($selected, $source?->default_from_email),
                 'active_viewers' => $selected->userStates()->with('user:id,name')->where('user_id', '!=', $user->id)->where('last_viewed_at', '>=', now()->subMinutes(2))->get()->map(fn ($state): array => ['id' => $state->user_id, 'name' => $state->user?->name ?? 'Teammate'])->values(),
                 'activity' => $selected->events()->with('user:id,name')->latest()->limit(20)->get()->map(fn ($event): array => [
@@ -184,9 +187,9 @@ class InboxController extends Controller
      * Inbound and outbound messages interleaved chronologically — one
      * conversation, both directions.
      *
-     * @return array<int, array<string, mixed>>
+     * @return array{messages: array<int, array<string, mixed>>, body_scope: string, body_version: string}
      */
-    private function messagesFor(Thread $thread): array
+    private function messagesFor(Thread $thread, Request $request): array
     {
         $inbound = $thread->inboundEmails()->get()->map(fn (InboundEmail $message): array => [
             'id' => $message->public_id,
@@ -197,13 +200,15 @@ class InboxController extends Controller
             'subject' => $message->subject,
             'text' => $message->text,
             'html' => $message->html,
+            'body_fingerprint' => hash('sha256', json_encode([$message->public_id, $message->html, $message->text])),
             'attachments' => $message->attachments ?? [],
             'status' => null,
             'at' => $message->received_at?->toIso8601String(),
             'at_human' => $message->received_at?->diffForHumans(short: true),
         ]);
 
-        $outbound = $thread->emails()->with(['recipients', 'attachments', 'events' => fn ($query) => $query->latest('occurred_at')->limit(1)])->get()->map(fn (Email $message): array => [
+        $outboundEmails = $thread->emails()->with(['recipients', 'attachments', 'events' => fn ($query) => $query->latest('occurred_at')->limit(1)])->get()->keyBy('public_id');
+        $outbound = $outboundEmails->map(fn (Email $message): array => [
             'id' => $message->public_id,
             'direction' => 'outbound',
             'from' => trim(($message->from_name ? $message->from_name.' ' : '').'<'.$message->from_email.'>'),
@@ -212,7 +217,8 @@ class InboxController extends Controller
             'subject' => $message->subject,
             'text' => $message->text,
             'html' => $message->html,
-            'attachments' => $message->attachments->map(fn ($attachment): array => ['filename' => $attachment->filename, 'content_type' => $attachment->content_type, 'size' => $attachment->size])->all(),
+            'body_fingerprint' => hash('sha256', json_encode([$message->public_id, $message->html, $message->text, $message->mime_disk, $message->mime_path, $message->mime_size])),
+            'attachments' => $message->attachments->map(fn ($attachment): array => ['filename' => $attachment->filename, 'content_type' => $attachment->content_type, 'size' => $attachment->size])->values()->all(),
             'status' => $message->status,
             'status_detail' => $message->events->first()?->payload['diagnosticCode'] ?? $message->events->first()?->payload['diagnostic'] ?? null,
             'can_retry' => in_array($message->status, ['failed', 'bounced'], true),
@@ -229,17 +235,80 @@ class InboxController extends Controller
             'subject' => null,
             'text' => $note->body,
             'html' => null,
+            'body_fingerprint' => hash('sha256', json_encode([$note->id, $note->body])),
             'attachments' => [],
             'status' => null,
             'at' => $note->created_at?->toIso8601String(),
             'at_human' => $note->created_at?->diffForHumans(short: true),
         ]);
 
-        return $inbound->concat($outbound)
+        $messages = $inbound->concat($outbound)
             ->concat($notes)
             ->sortBy('at')
-            ->values()
-            ->all();
+            ->values();
+        $scope = hash('sha256', json_encode([$thread->workspace_id, $thread->project_id, $thread->public_id]));
+        $version = hash('sha256', json_encode([$scope, $messages->pluck('body_fingerprint', 'id')->sortKeys()->all()]));
+        $sameScope = $request->header('X-Inbox-Body-Scope') === $scope;
+        $retryIds = $sameScope ? $this->retryMessageBodies($request) : [];
+        $reuseAll = $sameScope && $retryIds !== null && $request->header('X-Inbox-Body-Version') === $version;
+        $known = $sameScope && $retryIds !== null ? $this->knownMessageBodies($request) : [];
+
+        return [
+            'body_scope' => $scope,
+            'body_version' => $version,
+            'messages' => $messages->map(function (array $message) use ($reuseAll, $known, $outboundEmails, $retryIds): array {
+                if (! in_array($message['id'], $retryIds ?? [], true) && ($reuseAll || ($known[$message['id']] ?? null) === $message['body_fingerprint'])) {
+                    unset($message['html'], $message['text']);
+                } elseif ($message['direction'] === 'outbound') {
+                    $resolved = $this->inlineImages->resolve($outboundEmails->get($message['id']));
+                    $message['html'] = $resolved['html'];
+                    $message['body_retryable'] = $resolved['retryable'];
+                }
+
+                return $message;
+            })->all(),
+        ];
+    }
+
+    /** @return array<string, string> */
+    private function knownMessageBodies(Request $request): array
+    {
+        $header = $request->header('X-Inbox-Known-Bodies', '');
+        if (! is_string($header) || strlen($header) > 4096) {
+            return [];
+        }
+        $known = json_decode($header, associative: true, depth: 2);
+        if (! is_array($known) || count($known) > 25) {
+            return [];
+        }
+        foreach ($known as $id => $fingerprint) {
+            if (! is_string($id) || ! preg_match('/\A[A-Za-z0-9_-]{1,64}\z/', $id)
+                || ! is_string($fingerprint) || ! preg_match('/\A[a-f0-9]{64}\z/', $fingerprint)) {
+                return [];
+            }
+        }
+
+        return $known;
+    }
+
+    /** @return ?array<int, string> */
+    private function retryMessageBodies(Request $request): ?array
+    {
+        $header = $request->header('X-Inbox-Retry-Bodies', '[]');
+        if (! is_string($header) || strlen($header) > 2048) {
+            return null;
+        }
+        $ids = json_decode($header, associative: true, depth: 2);
+        if (! is_array($ids) || ! array_is_list($ids) || count($ids) > 25) {
+            return null;
+        }
+        foreach ($ids as $id) {
+            if (! is_string($id) || ! preg_match('/\A[A-Za-z0-9_-]{1,64}\z/', $id)) {
+                return null;
+            }
+        }
+
+        return $ids;
     }
 
     /**

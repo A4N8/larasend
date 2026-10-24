@@ -4,6 +4,7 @@ namespace App\Services;
 
 use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\Email;
+use Symfony\Component\Mime\Part\DataPart;
 
 class MimeMessageBuilder
 {
@@ -12,7 +13,7 @@ class MimeMessageBuilder
      * @param  array<string>  $cc
      * @param  array<string>  $bcc
      * @param  array<string, string>  $headers
-     * @param  array<int, array{filename: string, content: string, content_type?: string|null}>  $attachments
+     * @param  array<int, array{filename: string, content: string, content_type?: string|null, content_type_parameters?: array<string, string>, content_id?: string|null}>  $attachments
      */
     public function build(
         string $from,
@@ -59,11 +60,19 @@ class MimeMessageBuilder
         }
 
         foreach ($attachments as $attachment) {
-            $email->attach(
-                base64_decode($attachment['content'], strict: true) ?: '',
+            $content = base64_decode($attachment['content'], strict: true);
+            $part = new DataPart(
+                $content === false ? '' : $content,
                 $attachment['filename'],
                 $attachment['content_type'] ?? 'application/octet-stream',
             );
+            if (isset($attachment['content_type_parameters'])) {
+                $part->getHeaders()->addParameterizedHeader('Content-Type', $part->getContentType(), $attachment['content_type_parameters']);
+            }
+            if (isset($attachment['content_id'])) {
+                $part->asInline()->setContentId($attachment['content_id']);
+            }
+            $email->addPart($part);
         }
 
         return $email->toString();
