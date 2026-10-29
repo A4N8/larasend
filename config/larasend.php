@@ -4,6 +4,14 @@ return [
     'api_auth_rate_limit_per_minute' => (int) env('LARASEND_API_AUTH_RATE_LIMIT', 60),
     'api_rate_limit_per_minute' => (int) env('LARASEND_API_RATE_LIMIT', 120),
 
+    'storage' => [
+        'retries' => (int) env('AWS_S3_RETRIES', 1),
+        'http' => [
+            'connect_timeout' => (float) env('AWS_S3_CONNECT_TIMEOUT', 5),
+            'timeout' => (float) env('AWS_S3_TIMEOUT', 30),
+        ],
+    ],
+
     'queued_recovery' => [
         'minimum_age_minutes' => 2,
         'batch_size' => 500,

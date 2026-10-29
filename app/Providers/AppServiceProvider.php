@@ -20,7 +20,18 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        $storageDefaults = $this->app['config']->get('larasend.storage');
+
+        // Cloud replaces managed disk configuration before providers are registered.
+        foreach ($this->app['config']->get('filesystems.disks', []) as $name => $configuration) {
+            if (($configuration['driver'] ?? null) !== 's3') {
+                continue;
+            }
+
+            $configuration['http'] = ($configuration['http'] ?? []) + $storageDefaults['http'];
+            $configuration += ['retries' => $storageDefaults['retries']];
+            $this->app['config']->set('filesystems.disks.'.$name, $configuration);
+        }
     }
 
     /**
