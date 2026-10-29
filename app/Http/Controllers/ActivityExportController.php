@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Email;
 use App\Models\EmailRecipient;
 use App\Models\Project;
 use App\Support\ProjectContext;
@@ -20,13 +21,16 @@ class ActivityExportController extends Controller
             is_string($projectSlug) ? $projectSlug : null,
         );
         $section = (string) $request->query('section', 'activity');
-        $emails = $this->activityEmailsQuery($project, $request, $section)->get();
+        $status = strtolower(trim($request->string('status')->toString()));
+        $emails = $this->activityEmailsQuery($project, $request, $section)
+            ->when($section === 'outbound' && in_array($status, Email::FILTERABLE_STATUSES, true), fn ($query) => $query->where('status', $status))
+            ->select(['id', 'public_id', 'status', 'subject', 'template_id', 'sent_at', 'created_at', 'ses_message_id']);
 
         return response()->streamDownload(function () use ($emails) {
             $handle = fopen('php://output', 'w');
             fputcsv($handle, ['Message ID', 'Status', 'Recipient', 'Subject', 'Template', 'Sent at', 'SES message ID']);
 
-            foreach ($emails as $email) {
+            foreach ($emails->reorder()->lazyByIdDesc(200) as $email) {
                 $recipient = $email->recipients->firstWhere('type', 'to');
                 fputcsv($handle, [
                     $email->public_id,
@@ -47,7 +51,8 @@ class ActivityExportController extends Controller
     {
         $query = $project->emails()
             ->with(['recipients', 'template'])
-            ->latest();
+            ->latest()
+            ->orderByDesc('id');
 
         match ($section) {
             'sent' => $query->whereIn('status', ['sent', 'delivered', 'opened', 'clicked']),

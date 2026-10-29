@@ -28,11 +28,19 @@ import {
 import DashboardPanel from '@/components/DashboardPanel.vue';
 import EmailProviderPanel from '@/components/EmailProviderPanel.vue';
 import GlobalRail from '@/components/GlobalRail.vue';
+import PaginationControls from '@/components/PaginationControls.vue';
 import { Toaster } from '@/components/ui/sonner';
+import {
+    createSearchDebounce,
+    hasSearchChanges,
+    reconcileSearchDraft,
+} from '@/lib/activitySearch';
 import {
     refreshEmailSelection,
     selectEmailPreview,
 } from '@/lib/emailSelection';
+import { createPollRequestGuard } from '@/lib/pollRequestGuard';
+import { section as projectSection } from '@/routes/projects';
 
 type Metric = {
     label: string;
@@ -65,6 +73,8 @@ type EmailDetail = EmailRow & {
     bcc: string;
     html: string | null;
     text: string | null;
+    bodyLoaded: boolean;
+    bodyError?: boolean;
     headers: Record<string, string> | null;
     sesMessageId: string | null;
     mimeSize: number | null;
@@ -204,11 +214,23 @@ const props = defineProps<{
     projects: ProjectOption[];
     archivedProjects: ArchivedProjectOption[];
     section: string;
-    filters: { q: string; range: string };
+    filters: { q: string; range: string; status: string };
     metrics: Metric[];
+    dashboard:
+        | InstanceType<typeof DashboardPanel>['$props']['dashboard']
+        | null;
     bounceMetrics: BounceMetric[];
     bounceQueue: BounceQueueRow[];
     emails: EmailRow[];
+    emailPagination: {
+        page: number;
+        per_page: number;
+        from: number | null;
+        to: number | null;
+        has_previous: boolean;
+        has_more: boolean;
+    };
+    emailStatusCounts: Record<string, number>;
     selectedEmail: EmailDetail | null;
     sidebarCounts: Record<string, number>;
     inboxUnread?: number;
@@ -220,6 +242,9 @@ const props = defineProps<{
         direction: string | null;
         message_count: number;
         unread: boolean;
+        status: string;
+        priority: string;
+        assigned_to: string | null;
         last_activity_at: string | null;
         last_activity_human: string | null;
     }[];
@@ -361,7 +386,11 @@ const statusFilters = [
     'Complained',
     'Failed',
 ];
-const selectedFilter = ref('All');
+const selectedFilter = ref(
+    statusFilters.find(
+        (filter) => filter.toLowerCase() === props.filters.status,
+    ) ?? 'All',
+);
 const searchQuery = ref(props.filters.q);
 const searchInput = ref<HTMLInputElement | null>(null);
 const selectedRange = ref(props.filters.range || '14d');
@@ -392,7 +421,9 @@ const showingArchivedProjects = ref(false);
 const restoringProjectSlug = ref<string | null>(null);
 const confirmation = ref<ConfirmationState>(null);
 let copiedDnsTimer: ReturnType<typeof window.setTimeout> | null = null;
-let searchTimer: ReturnType<typeof window.setTimeout> | null = null;
+const searchDebounce = createSearchDebounce(() => applySearch());
+let removeSearchNavigationListener: (() => void) | null = null;
+let searchSubmission: { query: string } | null = null;
 let resizeStartX = 0;
 let resizeStartWidth = 0;
 const domainForm = useForm({ domain: '' });
@@ -509,6 +540,15 @@ const filteredEmails = computed(() => {
 });
 
 const statusFilterCounts = computed(() => {
+    if (props.section === 'outbound') {
+        return Object.fromEntries(
+            statusFilters.map((filter) => [
+                filter,
+                props.emailStatusCounts[filter.toLowerCase()] ?? 0,
+            ]),
+        );
+    }
+
     const counts: Record<string, number> = { All: props.emails.length };
 
     for (const filter of statusFilters.slice(1)) {
@@ -645,6 +685,10 @@ const exportHref = computed(() => {
         params.set('q', searchQuery.value);
     }
 
+    if (props.section === 'outbound' && selectedFilter.value !== 'All') {
+        params.set('status', selectedFilter.value.toLowerCase());
+    }
+
     return `${props.project.exportPath}?${params.toString()}`;
 });
 
@@ -695,20 +739,39 @@ const showRangeControls = computed(
     () => props.section === 'activity' || isMailSection.value,
 );
 
-usePoll(
+const { beginNavigation, ...pollRequestGuard } = createPollRequestGuard();
+const mailPolling = usePoll(
     5000,
     {
-        only: [
-            'emails',
-            'metrics',
-            'bounceMetrics',
-            'bounceQueue',
-            'sidebarCounts',
-            'quota',
-        ],
+        get only() {
+            return [
+                'emails',
+                'emailPagination',
+                'emailStatusCounts',
+                'metrics',
+                'sidebarCounts',
+                'quota',
+                ...(props.section === 'bounces'
+                    ? ['bounceMetrics', 'bounceQueue']
+                    : []),
+            ];
+        },
+        ...pollRequestGuard,
         showProgress: false,
     },
-    { autoStart: isMailSection.value },
+    { autoStart: false },
+);
+
+watch(
+    isMailSection,
+    (active) => {
+        if (active) {
+            mailPolling.start();
+        } else {
+            mailPolling.stop();
+        }
+    },
+    { immediate: true },
 );
 
 const hasPendingDomainCheck = computed(
@@ -743,19 +806,52 @@ watch(
     },
 );
 
-watch(searchQuery, () => {
-    if (!isMailSection.value) {
+watch(
+    () => props.filters,
+    (filters) => {
+        if (searchSubmission?.query !== filters.q) {
+            searchDebounce.cancel();
+        }
+
+        searchQuery.value = reconcileSearchDraft(
+            searchQuery.value,
+            searchSubmission?.query ?? null,
+            filters.q,
+        );
+        selectedRange.value = filters.range;
+
+        if (props.section === 'outbound') {
+            selectedFilter.value =
+                statusFilters.find(
+                    (filter) => filter.toLowerCase() === filters.status,
+                ) ?? 'All';
+        }
+    },
+);
+
+watch(searchQuery, (_query, _previous, onCleanup) => {
+    searchDebounce.cancel();
+
+    if (
+        !isMailSection.value ||
+        !hasSearchChanges(
+            searchQuery.value,
+            searchSubmission?.query ?? null,
+            props.filters.q,
+        )
+    ) {
         return;
     }
 
-    if (searchTimer) {
-        window.clearTimeout(searchTimer);
-    }
-
-    searchTimer = window.setTimeout(() => applySearch(), 350);
+    searchDebounce.schedule();
+    onCleanup(searchDebounce.cancel);
 });
 
 onMounted(() => {
+    removeSearchNavigationListener = router.on(
+        'start',
+        searchDebounce.onNavigationStart,
+    );
     const savedWidth = Number(
         window.localStorage.getItem('larasend:inspectorWidth'),
     );
@@ -769,6 +865,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+    removeSearchNavigationListener?.();
+    searchDebounce.cancel();
     stopInspectorResize();
     window.removeEventListener('keydown', handleGlobalShortcut);
 });
@@ -1200,6 +1298,8 @@ function resendEmail(): void {
                     only: [
                         'emails',
                         'selectedEmail',
+                        'emailPagination',
+                        'emailStatusCounts',
                         'metrics',
                         'sidebarCounts',
                         'quota',
@@ -1389,6 +1489,7 @@ function selectEmail(email: EmailRow): void {
 function reloadEmailPreview(
     id: string,
     receive: (detail: EmailDetail | null) => void,
+    fail: () => void,
 ): void {
     router.reload({
         data: { email: id },
@@ -1399,6 +1500,17 @@ function reloadEmailPreview(
                 (page.props.selectedEmail as EmailDetail | null | undefined) ??
                     null,
             ),
+        onError: fail,
+        onHttpException: () => {
+            fail();
+
+            return false;
+        },
+        onNetworkError: () => {
+            fail();
+
+            return false;
+        },
     });
 }
 
@@ -1406,13 +1518,52 @@ function closeInspector(): void {
     selectEmailPreview(selected, null, reloadEmailPreview);
 }
 
-function applySearch(): void {
+function applySearch(page = 1): void {
+    const submission = { query: searchQuery.value.trim() };
+    let finishNavigation = () => {};
+
+    searchDebounce.cancel();
+
     selected.value = null;
     router.get(
-        sectionPath.value,
-        { q: searchQuery.value, range: selectedRange.value },
-        { preserveState: true, preserveScroll: true, replace: true },
+        projectSection.url({
+            project: props.project.slug,
+            section: props.section,
+        }),
+        {
+            q: submission.query,
+            range: selectedRange.value,
+            page,
+            status:
+                props.section === 'outbound' && selectedFilter.value !== 'All'
+                    ? selectedFilter.value.toLowerCase()
+                    : '',
+        },
+        {
+            preserveState: true,
+            preserveScroll: true,
+            replace: true,
+            onStart: () => {
+                searchSubmission = submission;
+                finishNavigation = beginNavigation();
+            },
+            onFinish: () => {
+                finishNavigation();
+
+                if (searchSubmission === submission) {
+                    searchSubmission = null;
+                }
+            },
+        },
     );
+}
+
+function setStatusFilter(filter: string): void {
+    selectedFilter.value = filter;
+
+    if (props.section === 'outbound') {
+        applySearch();
+    }
 }
 
 function setRange(range: string): void {
@@ -1683,7 +1834,7 @@ function recipientTitle(email: EmailRow): string | undefined {
                 <form
                     v-if="isMailSection"
                     class="ml-auto hidden h-9 w-[min(420px,34vw)] items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 text-[13px] text-zinc-500 sm:flex dark:border-[#1d2125] dark:bg-[#111315] dark:text-[#9aa0a6]"
-                    @submit.prevent="applySearch"
+                    @submit.prevent="applySearch()"
                 >
                     <Search class="size-3.5" />
                     <input
@@ -1805,12 +1956,12 @@ function recipientTitle(email: EmailRow): string | undefined {
                     class="min-h-0 flex-1 overflow-auto p-5"
                 >
                     <DashboardPanel
+                        v-if="dashboard"
                         :project-slug="project.slug"
                         :metrics="metrics"
                         :emails="emails"
                         :recent-threads="recentThreads"
-                        :inbox-unread="inboxUnread ?? 0"
-                        :source-ready="Boolean(source?.can_send)"
+                        :dashboard="dashboard"
                         :system="system"
                     />
                 </div>
@@ -2131,7 +2282,7 @@ function recipientTitle(email: EmailRow): string | undefined {
                                     'border-zinc-300 bg-zinc-100 text-zinc-950 dark:border-[#262b30] dark:bg-[#1a1e22] dark:text-zinc-100':
                                         selectedFilter === filter,
                                 }"
-                                @click="selectedFilter = filter"
+                                @click="setStatusFilter(filter)"
                             >
                                 {{ filter }}
                                 <span
@@ -2238,6 +2389,18 @@ function recipientTitle(email: EmailRow): string | undefined {
                                 </button>
                             </template>
                         </div>
+                        <PaginationControls
+                            v-if="section === 'outbound'"
+                            class="shrink-0"
+                            :page="emailPagination.page"
+                            :from="emailPagination.from"
+                            :to="emailPagination.to"
+                            :has-previous="emailPagination.has_previous"
+                            :has-more="emailPagination.has_more"
+                            noun="emails"
+                            @previous="applySearch(emailPagination.page - 1)"
+                            @next="applySearch(emailPagination.page + 1)"
+                        />
                     </section>
 
                     <aside
@@ -2435,7 +2598,23 @@ function recipientTitle(email: EmailRow): string | undefined {
                                         KB</span
                                     >
                                 </div>
+                                <p v-if="selected.bodyError" role="alert">
+                                    Could not load this message.
+                                    <button
+                                        type="button"
+                                        @click="selectEmail(selected)"
+                                    >
+                                        Retry
+                                    </button>
+                                </p>
+                                <p
+                                    v-else-if="!selected.bodyLoaded"
+                                    role="status"
+                                >
+                                    Loading message…
+                                </p>
                                 <iframe
+                                    v-else
                                     title="Email preview"
                                     class="h-[520px] w-full bg-white"
                                     sandbox=""

@@ -1,5 +1,7 @@
 <?php
 
+use App\Actions\BuildProjectDashboard;
+use App\Http\Middleware\HandleInertiaRequests;
 use App\Models\ApiKey;
 use App\Models\Email;
 use App\Models\Project;
@@ -10,8 +12,210 @@ use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
 use App\Support\ProjectContext;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+
+it('uses unique trend keys and labels for short dashboard ranges', function (string $range, int $buckets) {
+    $user = User::factory()->create();
+    seedActivityDashboardData($user);
+
+    $this->actingAs($user)->get('/activity?range='.$range)
+        ->assertSuccessful()->assertInertia(fn ($page) => $page
+        ->where('dashboard.trend', fn ($trend) => collect($trend)->pluck('key')->unique()->count() === $buckets
+            && collect($trend)->pluck('label')->unique()->count() === $buckets));
+})->with([['1h', 6], ['7d', 8]]);
+
+it('matches the inbox per-user unread count and excludes closed conversations', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    foreach (['read', 'unread', 'closed'] as $state) {
+        $thread = Thread::create([
+            'public_id' => 'thread_read_state_'.$state,
+            'workspace_id' => $project->workspace_id,
+            'project_id' => $project->id,
+            'subject' => $state,
+            'subject_key' => $state,
+            'status' => $state === 'closed' ? 'closed' : 'open',
+            'read_at' => $state === 'unread' ? now() : null,
+            'last_activity_at' => now(),
+        ]);
+        if ($state === 'read') {
+            $thread->userStates()->create(['user_id' => $user->id, 'read_at' => now()]);
+        }
+    }
+
+    $this->actingAs($user)->get('/activity')->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->where('dashboard.inbox.open', 2)
+            ->where('dashboard.inbox.unread', 1)
+            ->where('inboxUnread', 1)
+            ->has('recentThreads', 2)
+            ->where('recentThreads', fn ($threads) => collect($threads)->where('unread', true)->pluck('subject')->all() === ['unread']));
+});
+
+it('keeps recent activity capped while dashboard totals remain exact', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $source = $project->sources()->firstOrFail();
+
+    foreach (range(1, 45) as $index) {
+        Email::create([
+            'public_id' => 'email_volume_'.$index,
+            'workspace_id' => $project->workspace_id,
+            'project_id' => $project->id,
+            'source_id' => $source->id,
+            'environment' => $source->environment,
+            'status' => 'delivered',
+            'from_email' => 'receipts@larasend.app',
+            'subject' => 'Volume message '.$index,
+        ]);
+    }
+
+    foreach (['queued', 'failed'] as $status) {
+        Email::create([
+            'public_id' => 'email_'.$status,
+            'workspace_id' => $project->workspace_id,
+            'project_id' => $project->id,
+            'source_id' => $source->id,
+            'environment' => $source->environment,
+            'status' => $status,
+            'from_email' => 'receipts@larasend.app',
+            'subject' => ucfirst($status).' message',
+        ]);
+    }
+
+    $this->actingAs($user)
+        ->get('/activity')
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->has('emails', 5)
+            ->where('dashboard.outbound.total', 59)
+            ->where('dashboard.outbound.queued', 1)
+            ->where('dashboard.outbound.failed', 1)
+            ->where('metrics.0.value', '59')
+        );
+});
+
+it('does not build dashboard aggregates for non-dashboard sections', function () {
+    $user = User::factory()->create();
+    seedActivityDashboardData($user);
+
+    mock(BuildProjectDashboard::class)->shouldNotReceive('execute');
+
+    $this->actingAs($user)
+        ->get('/templates')
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->component('Activity')
+            ->where('section', 'templates')
+            ->where('dashboard', null)
+        );
+});
+
+it('only alerts for api keys that expire within the next seven days', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $source = $project->sources()->firstOrFail();
+
+    ApiKey::issue($project, 'Expired key', $source, expiresAt: now()->subDay());
+    ApiKey::issue($project, 'Expiring key', $source, expiresAt: now()->addDays(3));
+    ApiKey::issue($project, 'Later key', $source, expiresAt: now()->addDays(10));
+
+    $this->actingAs($user)
+        ->get('/activity')
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->where('dashboard.developer.expiring_api_keys', 1)
+            ->where('dashboard.attention', fn ($attention) => collect($attention)->contains(
+                fn (array $item): bool => $item['key'] === 'api-keys' && $item['count'] === 1,
+            ))
+        );
+});
+
+it('paginates filtered outbound email with stable ordering and page metadata', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $source = $project->sources()->firstOrFail();
+    $createdAt = now()->subMinute()->startOfSecond();
+
+    foreach (range(1, 51) as $number) {
+        $email = Email::create([
+            'public_id' => 'email_pagination_'.$number,
+            'workspace_id' => $project->workspace_id,
+            'project_id' => $project->id,
+            'source_id' => $source->id,
+            'environment' => $source->environment,
+            'status' => 'delivered',
+            'from_email' => 'receipts@larasend.app',
+            'subject' => 'Pagination message '.$number,
+            'created_at' => $createdAt,
+            'updated_at' => $createdAt,
+        ]);
+
+        $email->recipients()->create([
+            'type' => 'to',
+            'email' => "recipient{$number}@example.com",
+        ]);
+    }
+
+    Email::create([
+        'public_id' => 'email_pagination_failed',
+        'workspace_id' => $project->workspace_id,
+        'project_id' => $project->id,
+        'source_id' => $source->id,
+        'environment' => $source->environment,
+        'status' => 'failed',
+        'from_email' => 'receipts@larasend.app',
+        'subject' => 'Pagination message failed',
+        'created_at' => $createdAt,
+        'updated_at' => $createdAt,
+    ]);
+
+    $query = 'q=Pagination%20message&range=30d&status=delivered';
+
+    $this->actingAs($user)
+        ->get("/projects/{$project->slug}/outbound?{$query}&page=-3")
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->has('emails', 50)
+            ->where('emails.0.subject', 'Pagination message 51')
+            ->where('emails.49.subject', 'Pagination message 2')
+            ->where('selectedEmail', null)
+            ->where('filters.status', 'delivered')
+            ->where('emailStatusCounts.all', 52)
+            ->where('emailStatusCounts.delivered', 51)
+            ->where('emailStatusCounts.failed', 1)
+            ->where('emailPagination.page', 1)
+            ->where('emailPagination.per_page', 50)
+            ->where('emailPagination.from', 1)
+            ->where('emailPagination.to', 50)
+            ->where('emailPagination.has_previous', false)
+            ->where('emailPagination.has_more', true));
+
+    $this->actingAs($user)
+        ->get("/projects/{$project->slug}/outbound?{$query}&page=2")
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->has('emails', 1)
+            ->where('emails.0.subject', 'Pagination message 1')
+            ->where('selectedEmail', null)
+            ->where('filters.q', 'Pagination message')
+            ->where('filters.range', '30d')
+            ->where('filters.status', 'delivered')
+            ->where('emailPagination.page', 2)
+            ->where('emailPagination.from', 51)
+            ->where('emailPagination.to', 51)
+            ->where('emailPagination.has_previous', true)
+            ->where('emailPagination.has_more', false));
+
+    $csv = $this->actingAs($user)
+        ->get("/projects/{$project->slug}/activity/export?section=outbound&{$query}")
+        ->assertSuccessful()->streamedContent();
+
+    expect($csv)->toContain('email_pagination_1,delivered')
+        ->not->toContain('email_pagination_failed');
+});
 
 it('routes incomplete first-run users to onboarding from dashboard', function () {
     $user = User::factory()->create();
@@ -36,7 +240,7 @@ it('renders the activity dashboard for authenticated users', function () {
             ->where('metrics', fn ($metrics) => collect($metrics)->every(fn (array $metric) => $metric['delta'] !== 'live'))
             ->has('suppressions', 2)
             ->where('quota.limit', null)
-            ->has('emails', 12)
+            ->has('emails', 5)
             ->where('emails', fn ($emails) => collect($emails)->contains(fn (array $email) => $email['subject'] === 'Your receipt from Northwind - #INV-4821'
                 && str_contains($email['recipient'], '+ 1 more')
                 && $email['recipient'] === 'maya.okafor@northwind.io, ops@kindsmile.test + 1 more'
@@ -48,6 +252,90 @@ it('renders the activity dashboard for authenticated users', function () {
             ->where('emails.0.headers.X-Larasend-Test', 'true')
             ->where('emails.0.previewUrl', fn (string $url) => str_contains($url, '/emails/') && str_ends_with($url, '/preview'))
         );
+});
+
+it('only computes requested dashboard metrics using two aggregate queries', function () {
+    $user = User::factory()->create();
+    seedActivityDashboardData($user);
+    DB::enableQueryLog();
+
+    try {
+        $this->actingAs($user)->withHeaders([
+            'X-Inertia' => 'true',
+            'X-Inertia-Version' => app(HandleInertiaRequests::class)->version(request()) ?? '',
+            'X-Inertia-Partial-Component' => 'Activity',
+            'X-Inertia-Partial-Data' => 'metrics',
+        ])->get('/outbound')->assertSuccessful()
+            ->assertJsonCount(6, 'props.metrics')
+            ->assertJsonMissingPath('props.emails');
+
+        $queries = collect(DB::getQueryLog())->pluck('query');
+        expect($queries->filter(fn (string $sql): bool => str_contains($sql, 'from "emails"')))->toHaveCount(2)
+            ->and($queries->filter(fn (string $sql): bool => str_contains($sql, 'from "email_recipients"')))->toBeEmpty()
+            ->and($queries->filter(fn (string $sql): bool => str_contains($sql, 'from "templates"')))->toBeEmpty();
+    } finally {
+        DB::disableQueryLog();
+        DB::flushQueryLog();
+    }
+});
+
+it('loads bodies only for the selected email rather than every list row', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $email = $project->emails()->firstOrFail();
+
+    $this->actingAs($user)->get('/outbound?email='.$email->public_id)
+        ->assertSuccessful()->assertInertia(fn ($page) => $page
+        ->where('emails.0.html', null)
+        ->where('emails.0.text', null)
+        ->where('selectedEmail.id', $email->public_id)
+        ->where('selectedEmail.text', $email->text));
+});
+
+it('streams CSV email queries only when the response body is consumed', function () {
+    $user = User::factory()->create();
+    seedActivityDashboardData($user);
+    DB::enableQueryLog();
+
+    try {
+        $response = $this->actingAs($user)->get('/activity/export')->assertSuccessful();
+        $queries = collect(DB::getQueryLog())->pluck('query');
+        expect($queries->filter(fn (string $sql): bool => str_contains($sql, 'from "emails"')))->toBeEmpty();
+        expect($response->streamedContent())->toContain('maya.okafor@northwind.io');
+        $emailQueries = collect(DB::getQueryLog())->pluck('query')
+            ->filter(fn (string $sql): bool => str_contains($sql, 'from "emails"'));
+        expect($emailQueries)->not->toBeEmpty();
+        foreach ($emailQueries as $query) {
+            expect($query)->toContain('limit');
+        }
+    } finally {
+        DB::disableQueryLog();
+        DB::flushQueryLog();
+    }
+});
+
+it('does not duplicate exported rows when new mail arrives between batches', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $template = $project->emails()->firstOrFail();
+    foreach (range(1, 205) as $index) {
+        $template->replicate()->fill(['public_id' => 'email_export_'.$index])->save();
+    }
+    $expected = $project->emails()->pluck('public_id')->sort()->values()->all();
+    $inserted = false;
+    DB::listen(function (QueryExecuted $query) use ($template, &$inserted): void {
+        if (! $inserted && str_contains($query->sql, 'from "emails"') && str_contains($query->sql, 'limit 200')) {
+            $inserted = true;
+            $template->replicate()->fill(['public_id' => 'email_arrived_during_export'])->save();
+        }
+    });
+
+    $content = $this->actingAs($user)->get('/activity/export')->assertSuccessful()->streamedContent();
+    $rows = array_map('str_getcsv', array_filter(explode("\n", trim($content))));
+    array_shift($rows);
+
+    expect($inserted)->toBeTrue()
+        ->and(collect($rows)->pluck(0)->sort()->values()->all())->toBe($expected);
 });
 
 it('renders recent active inbox conversations on the dashboard', function () {
@@ -416,7 +704,10 @@ it('keeps recipient searches uncorrelated to avoid expensive database plans', fu
     DB::enableQueryLog();
 
     try {
-        $this->actingAs($user)->get($path.'?q=maya')->assertSuccessful();
+        $response = $this->actingAs($user)->get($path.'?q=maya')->assertSuccessful();
+        if ($path === '/activity/export') {
+            $response->streamedContent();
+        }
 
         $searchQueries = collect(DB::getQueryLog())
             ->filter(fn (array $query): bool => in_array('%maya%', $query['bindings'], true));
@@ -596,7 +887,7 @@ function seedActivityDashboardData(User $user): Project
 
     foreach ($rows as $index => [$name, $recipient, $status, $subject, $opens, $clicks]) {
         $createdAt = now()->subMinutes(5 + $index);
-        $email = Email::create([
+        $email = Email::forceCreate([
             'public_id' => 'email_'.Str::random(24),
             'workspace_id' => $project->workspace_id,
             'project_id' => $project->id,
