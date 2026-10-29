@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\EmailRecipient;
 use App\Models\Project;
 use App\Support\ProjectContext;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -74,10 +75,12 @@ class ActivityExportController extends Controller
                     ->orWhereLike('ses_message_id', "%{$search}%")
                     ->orWhereLike('subject', "%{$search}%")
                     ->orWhereLike('from_email', "%{$search}%")
-                    ->orWhereHas('recipients', function ($query) use ($search) {
-                        $query->whereLike('email', "%{$search}%")
-                            ->orWhereLike('name', "%{$search}%");
-                    });
+                    ->orWhereIn('emails.id', EmailRecipient::query()
+                        ->select('email_id')
+                        ->where(function ($query) use ($search) {
+                            $query->whereLike('email', "%{$search}%")
+                                ->orWhereLike('name', "%{$search}%");
+                        }));
             });
         }
 
