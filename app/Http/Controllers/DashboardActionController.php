@@ -317,7 +317,11 @@ class DashboardActionController extends Controller
     {
         $project = $this->projectFor(Auth::user());
         $this->authorizeWorkspaceCapability($project, 'manage_suppressions');
-        $suppression = $project->suppressions()->findOrFail($request->route('suppression'));
+        $suppressionId = filter_var($request->route('suppression'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+
+        abort_if($suppressionId === false, 404);
+
+        $suppression = $project->suppressions()->findOrFail($suppressionId);
 
         try {
             $removalService->remove($suppression);

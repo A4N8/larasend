@@ -52,6 +52,10 @@ class EmailController extends Controller
             return response()->json(['message' => 'The Idempotency-Key header may not exceed 255 bytes.'], 422);
         }
 
+        if (preg_match('//u', $clientKey) !== 1) {
+            return response()->json(['message' => 'The Idempotency-Key header must contain valid UTF-8.'], 422);
+        }
+
         $idempotencyKey = null;
         $idempotencyHash = null;
 
@@ -93,7 +97,7 @@ class EmailController extends Controller
         }
 
         if ($email->status === 'queued') {
-            SendQueuedEmail::dispatchAfterCommit($email->id);
+            SendQueuedEmail::dispatchAfterCommit($email->id, reportFailure: true);
         }
 
         return response()->json(['id' => $email->public_id, 'object' => 'email', 'replayed' => true], 202);

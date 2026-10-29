@@ -14,7 +14,9 @@ use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Queue\SyncQueue;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 use Throwable;
@@ -44,19 +46,50 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
         return (string) $this->emailId;
     }
 
-    public static function dispatchAfterCommit(int $emailId): void
+    public static function dispatchAfterCommit(int $emailId, bool $reportFailure = false): void
     {
-        DB::afterCommit(static function () use ($emailId): void {
+        DB::afterCommit(static function () use ($emailId, $reportFailure): void {
             $job = new self($emailId);
+
+            try {
+                $connection = Queue::connection($job->connection);
+            } catch (Throwable $exception) {
+                if (! $reportFailure) {
+                    throw $exception;
+                }
+
+                self::reportDispatchFailure($exception);
+
+                return;
+            }
 
             try {
                 dispatch($job)->beforeCommit();
             } catch (Throwable $exception) {
-                (new UniqueLock(app(Repository::class)))->release($job);
+                try {
+                    (new UniqueLock(app(Repository::class)))->release($job);
+                } catch (Throwable $releaseException) {
+                    self::reportDispatchFailure($releaseException);
+                }
+
+                if ($reportFailure && ! $connection instanceof SyncQueue) {
+                    self::reportDispatchFailure($exception);
+
+                    return;
+                }
 
                 throw $exception;
             }
         });
+    }
+
+    private static function reportDispatchFailure(Throwable $exception): void
+    {
+        try {
+            report($exception);
+        } catch (Throwable) {
+            // Reporting failures must not turn an accepted durable email into a rejected request.
+        }
     }
 
     public function handle(EmailProviderFactory $providers): void

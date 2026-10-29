@@ -118,7 +118,7 @@ class EmailSendService
             }
         });
 
-        SendQueuedEmail::dispatchAfterCommit($email->id);
+        SendQueuedEmail::dispatchAfterCommit($email->id, reportFailure: true);
 
         return $email;
     }

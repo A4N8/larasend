@@ -11,7 +11,7 @@ Route::middleware(['throttle:larasend-api-auth', AuthenticateLarasendApiKey::cla
     Route::get('emails', [EmailController::class, 'index'])->name('api.emails.index');
     Route::post('emails', [EmailController::class, 'store'])->name('api.emails.store');
     Route::get('emails/{email}', [EmailController::class, 'show'])->name('api.emails.show');
-    Route::delete('suppressions/{suppression}', [SuppressionController::class, 'destroy'])->name('api.suppressions.destroy');
+    Route::delete('suppressions/{suppression}', [SuppressionController::class, 'destroy'])->whereNumber('suppression')->name('api.suppressions.destroy');
 });
 
 Route::post('webhooks/ses/{token}', SesWebhookController::class)

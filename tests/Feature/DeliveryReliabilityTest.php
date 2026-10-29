@@ -14,10 +14,12 @@ use App\Services\SesV2Client;
 use App\Services\WebhookDeliveryService;
 use Illuminate\Bus\UniqueLock;
 use Illuminate\Contracts\Bus\Dispatcher;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
@@ -137,17 +139,101 @@ it('does not downgrade an email already updated by a provider event when a job f
     expect($email->fresh()->status)->toBe('delivered');
 });
 
-it('releases a unique send lock when queue dispatch fails and preserves committed mime', function (): void {
+it('accepts a durable send during a broker outage and recovers it once without losing mime or attachments', function (?string $key): void {
+    [, , $token] = deliveryReliabilityFixture();
+    Exceptions::fake();
+    $realDispatcher = app(Dispatcher::class);
+    $outage = new RuntimeException('Queue unavailable');
+    $dispatcher = Mockery::mock(Dispatcher::class);
+    $dispatcher->shouldReceive('dispatch')->times($key === null ? 1 : 2)->andThrow($outage);
+    $this->app->instance(Dispatcher::class, $dispatcher);
+    $payload = deliveryReliabilityPayload() + ['attachments' => [['filename' => 'receipt.txt', 'content' => base64_encode('Durable attachment')]]];
+    $this->withToken($token);
+
+    if ($key !== null) {
+        $this->withHeader('Idempotency-Key', $key);
+    }
+
+    $response = $this->postJson('/api/emails', $payload)->assertAccepted();
+    $email = Email::query()->sole();
+    expect($email->status)->toBe('queued')->and($response->json('id'))->toBe($email->public_id)
+        ->and($email->attachments()->sole()->filename)->toBe('receipt.txt');
+    Storage::disk($email->mime_disk)->assertExists($email->mime_path);
+    $lock = Cache::lock(UniqueLock::getKey(new SendQueuedEmail($email->id)), 10);
+    expect($lock->get())->toBeTrue();
+    $lock->release();
+    Exceptions::assertReported(fn (RuntimeException $exception): bool => $exception === $outage);
+
+    if ($key !== null) {
+        $this->postJson('/api/emails', $payload)->assertAccepted()->assertJsonPath('id', $email->public_id)->assertJsonPath('replayed', true);
+    }
+
+    $this->app->instance(Dispatcher::class, $realDispatcher);
+    $email->forceFill(['created_at' => now()->subMinutes(5)])->save();
+    (new RecoverStuckQueuedEmails)->handle();
+    (new RecoverStuckQueuedEmails)->handle();
+    Queue::assertPushed(SendQueuedEmail::class, 1);
+    $client = Mockery::mock(SesV2Client::class);
+    $client->shouldReceive('sendRawEmail')->once()->andReturn(['message_id' => 'ses-recovered-outage', 'response' => []]);
+    $this->app->instance(SesV2Client::class, $client);
+    $job = new SendQueuedEmail($email->id);
+    $job->handle(app(EmailProviderFactory::class));
+    $job->handle(app(EmailProviderFactory::class));
+    expect(Email::query()->count())->toBe(1)->and($email->fresh()->status)->toBe('sent');
+})->with(['legacy unkeyed client' => [null], 'idempotent client and replay' => ['broker-outage']]);
+
+it('does not turn a synchronous provider exception into accepted enqueue failure', function (): void {
+    $realQueue = Queue::getFacadeRoot();
+    [, , $token] = deliveryReliabilityFixture();
+    Queue::swap($realQueue);
+    $client = Mockery::mock(SesV2Client::class);
+    $client->shouldReceive('sendRawEmail')->once()->andThrow(new RuntimeException('Provider response was lost'));
+    $this->app->instance(SesV2Client::class, $client);
+    $this->withoutExceptionHandling();
+    expect(fn () => $this->withToken($token)->postJson('/api/emails', deliveryReliabilityPayload()))
+        ->toThrow(RuntimeException::class, 'Provider response was lost');
+    expect(Email::query()->sole()->status)->toBe('sending');
+});
+
+it('rejects malformed UTF8 idempotency headers before storing an email', function (): void {
+    [, , $token] = deliveryReliabilityFixture();
+    $this->withToken($token)->withHeader('Idempotency-Key', "invalid-\xFF")
+        ->postJson('/api/emails', deliveryReliabilityPayload())->assertUnprocessable();
+    expect(Email::query()->count())->toBe(0);
+    Storage::disk('local')->assertDirectoryEmpty('emails');
+});
+
+it('accepts a durable email even if reporting the broker outage also fails', function (): void {
     [, , $token] = deliveryReliabilityFixture();
     $dispatcher = Mockery::mock(Dispatcher::class);
     $dispatcher->shouldReceive('dispatch')->once()->andThrow(new RuntimeException('Queue unavailable'));
     $this->app->instance(Dispatcher::class, $dispatcher);
-    $this->withoutExceptionHandling();
-    expect(fn () => $this->withToken($token)->postJson('/api/emails', deliveryReliabilityPayload()))->toThrow(RuntimeException::class, 'Queue unavailable');
-    $email = Email::query()->sole();
-    expect($email->status)->toBe('queued');
-    Storage::disk($email->mime_disk)->assertExists($email->mime_path);
-    expect(Cache::lock(UniqueLock::getKey(new SendQueuedEmail($email->id)), 10)->get())->toBeTrue();
+    $handler = Mockery::mock(ExceptionHandler::class);
+    $handler->shouldReceive('report')->once()->andThrow(new RuntimeException('Reporting unavailable'));
+    $this->app->instance(ExceptionHandler::class, $handler);
+    $this->withToken($token)->postJson('/api/emails', deliveryReliabilityPayload())->assertAccepted();
+    expect(Email::query()->sole()->status)->toBe('queued');
+});
+
+it('contains an accepted enqueue failure in the deferred outer commit callback', function (): void {
+    [, , $token] = deliveryReliabilityFixture();
+    Exceptions::fake();
+    $dispatcher = Mockery::mock(Dispatcher::class);
+    $dispatcher->shouldReceive('dispatch')->once()->andThrow(new RuntimeException('Deferred broker outage'));
+    $this->app->instance(Dispatcher::class, $dispatcher);
+    DB::beginTransaction();
+
+    try {
+        $this->withToken($token)->postJson('/api/emails', deliveryReliabilityPayload())->assertAccepted();
+        $dispatcher->shouldNotHaveReceived('dispatch');
+        DB::commit();
+        expect(Email::query()->sole()->status)->toBe('queued');
+        Exceptions::assertReported(fn (RuntimeException $exception): bool => $exception->getMessage() === 'Deferred broker outage');
+    } finally {
+        while (DB::transactionLevel() > 1) {
+            DB::rollBack();
+        }
+    }
 });
 
 it('retries a definitive SES rejection without recording an ambiguous outcome', function (): void {

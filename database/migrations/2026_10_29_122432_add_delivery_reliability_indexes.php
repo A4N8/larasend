@@ -11,6 +11,41 @@ return new class extends Migration
 
     public function up(): void
     {
+        if (DB::getDriverName() !== 'pgsql') {
+            $this->createIndexes();
+
+            return;
+        }
+
+        $previousTimeout = DB::scalar('SHOW lock_timeout');
+        $failure = null;
+
+        try {
+            DB::statement("SET lock_timeout = '5s'");
+            $this->createIndexes();
+        } catch (Throwable $exception) {
+            $failure = $exception;
+
+            throw $exception;
+        } finally {
+            try {
+                DB::selectOne("SELECT set_config('lock_timeout', ?, false)", [$previousTimeout]);
+            } catch (Throwable $restoreException) {
+                if ($failure === null) {
+                    throw $restoreException;
+                }
+
+                try {
+                    report($restoreException);
+                } catch (Throwable) {
+                    // Preserve the original migration error even if reporting is unavailable.
+                }
+            }
+        }
+    }
+
+    private function createIndexes(): void
+    {
         $indexes = [
             ['emails', 'emails_project_id_idempotency_key_unique', ['project_id', 'idempotency_key'], true],
             ['email_events', 'email_events_provider_event_id_unique', ['provider_event_id'], true],

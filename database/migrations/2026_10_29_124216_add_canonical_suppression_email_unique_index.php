@@ -13,6 +13,41 @@ return new class extends Migration
 
     public function up(): void
     {
+        if (DB::getDriverName() !== 'pgsql') {
+            $this->createIndex();
+
+            return;
+        }
+
+        $previousTimeout = DB::scalar('SHOW lock_timeout');
+        $failure = null;
+
+        try {
+            DB::statement("SET lock_timeout = '5s'");
+            $this->createIndex();
+        } catch (Throwable $exception) {
+            $failure = $exception;
+
+            throw $exception;
+        } finally {
+            try {
+                DB::selectOne("SELECT set_config('lock_timeout', ?, false)", [$previousTimeout]);
+            } catch (Throwable $restoreException) {
+                if ($failure === null) {
+                    throw $restoreException;
+                }
+
+                try {
+                    report($restoreException);
+                } catch (Throwable) {
+                    // Preserve the original migration error even if reporting is unavailable.
+                }
+            }
+        }
+    }
+
+    private function createIndex(): void
+    {
         $driver = DB::getDriverName();
 
         if ($driver === 'pgsql') {

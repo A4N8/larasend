@@ -6,6 +6,7 @@ use App\Models\Suppression;
 use App\Models\User;
 use App\Services\SuppressionRemovalService;
 use App\Support\ProjectContext;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 
 function suppressionDashboardFixture(): array
@@ -186,3 +187,16 @@ it('preserves the dashboard blocker and shows the exact IAM permission needed af
 
     expect($suppression->fresh())->not->toBeNull();
 });
+
+it('rejects malformed or out-of-range dashboard suppression ids before querying the table', function (string $id, bool $projectRoute) {
+    [$owner, $project] = suppressionDashboardFixture();
+    $queries = [];
+    DB::listen(function ($query) use (&$queries): void {
+        $queries[] = $query->sql;
+    });
+    $path = $projectRoute ? "/projects/{$project->slug}/suppressions/{$id}" : "/suppressions/{$id}";
+
+    $this->actingAs($owner)->deleteJson($path)->assertNotFound();
+
+    expect(collect($queries)->filter(fn (string $query): bool => str_contains($query, 'suppressions')))->toBeEmpty();
+})->with(['not-a-number', '018c0d95-7e7a-708a-98f1-2cc8b5bfc12b', '999999999999999999999999999999', '0'])->with([true, false]);

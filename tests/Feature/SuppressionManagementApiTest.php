@@ -125,3 +125,30 @@ it('returns actionable IAM guidance after an SES denial without exposing the pro
     expect($response->json('message'))->toContain('ses:DeleteSuppressedDestination')->not->toContain('Sensitive provider details')
         ->and($suppression->fresh())->not->toBeNull();
 });
+
+it('authenticates before looking up either existing or missing numeric suppression ids', function () {
+    [, $suppression] = suppressionApiFixture();
+    $queries = [];
+    DB::listen(function ($query) use (&$queries): void {
+        $queries[] = $query->sql;
+    });
+
+    $this->deleteJson("/api/suppressions/{$suppression->id}")
+        ->assertUnauthorized()->assertJsonPath('message', 'Missing Larasend API key.');
+    $this->deleteJson('/api/suppressions/999999999')
+        ->assertUnauthorized()->assertJsonPath('message', 'Missing Larasend API key.');
+
+    expect(collect($queries)->filter(fn (string $query): bool => str_contains($query, 'suppressions')))->toBeEmpty();
+});
+
+it('rejects malformed or out-of-range api suppression ids before querying the table', function (string $id) {
+    [$issued] = suppressionApiFixture();
+    $queries = [];
+    DB::listen(function ($query) use (&$queries): void {
+        $queries[] = $query->sql;
+    });
+
+    $this->withToken($issued['plain_text'])->deleteJson("/api/suppressions/{$id}")->assertNotFound();
+
+    expect(collect($queries)->filter(fn (string $query): bool => str_contains($query, 'suppressions')))->toBeEmpty();
+})->with(['not-a-number', '018c0d95-7e7a-708a-98f1-2cc8b5bfc12b', '999999999999999999999999999999', '0']);
