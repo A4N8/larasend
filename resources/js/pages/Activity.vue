@@ -2315,6 +2315,23 @@ function recipientTitle(email: EmailRow): string | undefined {
                         <div
                             class="min-h-0 flex-1 overflow-auto bg-[#fbfaf7] dark:bg-[#0b0c0d]"
                         >
+                            <div
+                                v-if="groupedEmails.length === 0"
+                                role="status"
+                                class="px-5 py-12 text-center"
+                            >
+                                <p
+                                    class="text-sm font-medium text-zinc-700 dark:text-zinc-300"
+                                >
+                                    No emails found
+                                </p>
+                                <p
+                                    class="mt-1 text-xs text-zinc-500 dark:text-zinc-400"
+                                >
+                                    Try changing your search, status filter, or
+                                    date range.
+                                </p>
+                            </div>
                             <template
                                 v-for="group in groupedEmails"
                                 :key="group.label"
@@ -2525,7 +2542,7 @@ function recipientTitle(email: EmailRow): string | undefined {
                                 >
                                     Sent
                                 </dt>
-                                <dd>{{ selected.time }} ago</dd>
+                                <dd>{{ selected.time }}</dd>
                                 <dt
                                     v-if="selected.template"
                                     class="font-mono tracking-widest text-zinc-500 uppercase"
