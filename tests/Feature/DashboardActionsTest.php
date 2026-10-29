@@ -116,7 +116,7 @@ it('configures a ses source and creates domain dns records', function () {
             'ses_configuration_set' => 'larasend-prod',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 180,
+            'retention_days' => 731,
         ])
         ->assertRedirect('/source');
 

@@ -308,7 +308,7 @@ it('reads MIME only for an authorized selected activity email and skips list or 
     });
     Storage::set('local', $spy);
     $owner = User::query()->findOrFail($workspace->owner_id);
-    $url = '/projects/'.$project->slug.'/activity';
+    $url = '/projects/'.$project->slug.'/outbound';
 
     $this->actingAs($owner)->get($url)->assertInertia(fn ($page) => $page->has('emails', 50)->where('selectedEmail', null));
     expect($reads)->toBe([]);

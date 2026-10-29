@@ -11,6 +11,8 @@ class Email extends Model
 {
     use HasFactory;
 
+    public const FILTERABLE_STATUSES = ['delivered', 'opened', 'clicked', 'queued', 'sending', 'bounced', 'complained', 'failed'];
+
     protected $fillable = [
         'public_id',
         'workspace_id',

@@ -63,7 +63,7 @@ const form = useForm({
     aws_access_key_id: '',
     aws_secret_access_key: '',
     aws_session_token: '',
-    retention_days: props.source?.retention_days ?? 90,
+    retention_days: props.source?.retention_days ?? 731,
 });
 
 const isCloudflare = computed(() => form.provider === 'cloudflare');

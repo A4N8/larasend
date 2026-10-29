@@ -9,6 +9,19 @@ const second = {
     status: 'queued',
 };
 
+test('older requests for the same email cannot replace or hide a newer preview', () => {
+    const state = { value: null };
+    const requests = [];
+    const reload = (id, receive, fail) => requests.push({ receive, fail });
+    selectEmailPreview(state, first, reload);
+    selectEmailPreview(state, first, reload);
+    requests[1].receive({ ...first, html: 'new preview', bodyLoaded: true });
+    requests[0].fail();
+    assert.notEqual(state.value.bodyError, true);
+    requests[0].receive({ ...first, html: 'old preview' });
+    assert.equal(state.value.html, 'new preview');
+});
+
 test('selection immediately shows the new email body while requesting its detail', () => {
     const state = { value: first };
     const requests = [];
@@ -67,6 +80,34 @@ test('polling updates status while preserving resolved HTML for the same email',
     ]);
     assert.equal(selected.status, 'delivered');
     assert.equal(selected.html, first.html);
+});
+
+test('summary polling preserves loaded text and body state', () => {
+    const selected = refreshEmailSelection(
+        { ...first, text: 'Loaded plain text', bodyLoaded: true },
+        [{ ...first, text: null, html: null, bodyLoaded: false }],
+    );
+    assert.equal(selected.text, 'Loaded plain text');
+    assert.equal(selected.bodyLoaded, true);
+});
+
+test('failed detail loads expose a retry state without affecting another selection', () => {
+    const state = { value: null };
+    const requests = [];
+    const reload = (id, receive, fail) => requests.push({ id, receive, fail });
+    selectEmailPreview(
+        state,
+        { ...first, html: null, bodyLoaded: false },
+        reload,
+    );
+    requests[0].fail();
+    assert.equal(state.value.bodyError, true);
+    selectEmailPreview(state, state.value, reload);
+    assert.equal(state.value.bodyError, false);
+    selectEmailPreview(state, second, reload);
+    requests[1].fail();
+    assert.equal(state.value.id, 'second');
+    assert.equal(state.value.bodyError, false);
 });
 
 test('polling preserves a selected email outside the current list window and keeps a closed inspector closed', () => {

@@ -3,6 +3,7 @@
 namespace App\Http\Requests;
 
 use App\Enums\SourceProvider;
+use App\Models\Source;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
 
@@ -31,7 +32,10 @@ class UpdateSourceRequest extends FormRequest
             'aws_access_key_id' => ['nullable', 'string', 'max:255'],
             'aws_secret_access_key' => ['nullable', 'string', 'max:255'],
             'aws_session_token' => ['nullable', 'string'],
-            'retention_days' => ['required', 'integer', 'min:1', 'max:3650'],
+            'retention_days' => ['required', Rule::anyOf([
+                ['integer', 'in:0'],
+                ['integer', 'min:'.Source::MINIMUM_RETENTION_DAYS, 'max:3650'],
+            ])],
         ];
     }
 }

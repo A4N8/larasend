@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Actions\BuildProjectDashboard;
 use App\Enums\SourceProvider;
 use App\Models\Email;
 use App\Models\EmailRecipient;
@@ -20,6 +21,7 @@ use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use Inertia\Inertia;
@@ -27,10 +29,13 @@ use Inertia\Response;
 
 class ActivityController extends Controller
 {
+    private const EMAILS_PER_PAGE = 50;
+
     public function __construct(
         private EmailProviderFactory $providers,
         private SystemHealth $systemHealth,
         private EmailInlineImageResolver $inlineImages,
+        private BuildProjectDashboard $buildProjectDashboard,
     ) {}
 
     public function __invoke(Request $request, ProjectContext $context): Response|RedirectResponse
@@ -63,11 +68,43 @@ class ActivityController extends Controller
             return redirect($context->sectionPath($project, 'identities'));
         }
 
-        $emails = $this->activityEmailsQuery($project, $request, $section)
-            ->limit(50)
-            ->get();
+        $emailStatus = $section === 'outbound' ? strtolower(trim($request->string('status')->toString())) : '';
+        if (! in_array($emailStatus, Email::FILTERABLE_STATUSES, true)) {
+            $emailStatus = '';
+        }
+        $emailPage = null;
+        $loadEmails = function () use (&$emailPage, $project, $request, $section, $emailStatus): Paginator {
+            return $emailPage ??= $this->activityEmailsQuery($project, $request, $section)
+                ->when($emailStatus !== '', fn ($query) => $query->where('status', $emailStatus))
+                ->without(['attachments', 'source'])
+                ->with(['events:id,email_id,event_type,recipient,occurred_at'])
+                ->simplePaginate(
+                    $section === 'activity' ? 5 : self::EMAILS_PER_PAGE,
+                    ['id', 'public_id', 'project_id', 'source_id', 'template_id', 'from_email', 'from_name', 'subject', 'status', 'ses_message_id', 'mime_size', 'headers', 'created_at'],
+                    'page',
+                    $section === 'outbound' ? max(1, $request->integer('page', 1)) : 1,
+                );
+        };
 
-        $canSend = $source ? $this->canSend($project, $source) : false;
+        $system = null;
+        $loadSystem = function () use (&$system, $project): array {
+            return $system ??= [
+                'worker_alive' => $this->systemHealth->workerIsAlive(),
+                'worker_last_seen' => $this->systemHealth->workerHeartbeatAt()?->diffForHumans(),
+                'scheduler_alive' => $this->systemHealth->schedulerIsAlive(),
+                'scheduler_last_seen' => $this->systemHealth->schedulerHeartbeatAt()?->diffForHumans(),
+                'stuck_queued' => $this->systemHealth->stuckQueuedEmailCount($project),
+            ];
+        };
+        $quota = null;
+        $loadQuota = function () use (&$quota, $project, $source): array {
+            return $quota ??= $this->quota($project, $source);
+        };
+        $inboxUnread = null;
+        $loadInboxUnread = function () use (&$inboxUnread, $project, $user): int {
+            return $inboxUnread ??= $this->activeInboxThreads($project)
+                ->whereDoesntHave('userStates', fn ($query) => $query->where('user_id', $user->id)->whereNotNull('read_at'))->count();
+        };
 
         return Inertia::render('Activity', [
             'project' => [
@@ -80,7 +117,7 @@ class ActivityController extends Controller
                 'path' => $context->sectionPath($project),
                 'exportPath' => $context->exportPath($project),
             ],
-            'workspace' => [
+            'workspace' => fn () => [
                 'name' => $project->workspace->name,
                 'slug' => $project->workspace->slug,
                 'can_manage_members' => $project->workspace->canManageMembers($user),
@@ -88,8 +125,8 @@ class ActivityController extends Controller
                 'can_manage_domains' => $project->workspace->canManageDomains($user),
                 'can_send' => $project->workspace->canSendEmail($user),
             ],
-            'workspaceMembers' => $this->workspaceMembers($project),
-            'projects' => $context->projectsFor($user)->map(fn (Project $workspaceProject): array => [
+            'workspaceMembers' => fn () => $this->workspaceMembers($project),
+            'projects' => fn () => $context->projectsFor($user)->map(fn (Project $workspaceProject): array => [
                 'name' => $workspaceProject->name,
                 'slug' => $workspaceProject->slug,
                 'environment' => $workspaceProject->sources->first()?->environment ?? $workspaceProject->default_environment,
@@ -104,7 +141,7 @@ class ActivityController extends Controller
                 'can_delete' => $workspaceProject->emails_count === 0 && $workspaceProject->domains_count === 0,
                 'delete_block_reason' => $this->deleteBlockReason($workspaceProject),
             ])->values(),
-            'archivedProjects' => $context->archivedProjectsFor($user)->map(fn (Project $workspaceProject): array => [
+            'archivedProjects' => fn () => $context->archivedProjectsFor($user)->map(fn (Project $workspaceProject): array => [
                 'name' => $workspaceProject->name,
                 'slug' => $workspaceProject->slug,
                 'environment' => $workspaceProject->sources->first()?->environment ?? $workspaceProject->default_environment,
@@ -117,11 +154,45 @@ class ActivityController extends Controller
             'filters' => [
                 'q' => $request->string('q')->toString(),
                 'range' => $request->string('range', '14d')->toString(),
+                'status' => $emailStatus,
             ],
-            'metrics' => $this->metrics($project, $request->string('range', '14d')->toString()),
-            'bounceMetrics' => $this->bounceMetrics($project),
-            'bounceQueue' => $this->bounceQueue($project, $request),
-            'emails' => $emails->map(fn (Email $email) => $this->serializeEmail($email, detailed: true)),
+            'metrics' => fn () => $this->metrics($project, $request->string('range', '14d')->toString()),
+            'dashboard' => function () use ($section, $project, $source, $user, $request, $loadSystem, $loadQuota, $loadInboxUnread): ?array {
+                if ($section !== 'activity') {
+                    return null;
+                }
+
+                $range = $request->string('range', '14d')->toString();
+                [$currentStart, $currentEnd] = $this->metricPeriods($range);
+
+                return $this->buildProjectDashboard->execute(
+                    project: $project,
+                    source: $source,
+                    user: $user,
+                    range: $range,
+                    currentStart: $currentStart,
+                    currentEnd: $currentEnd,
+                    system: $loadSystem(),
+                    quota: $loadQuota(),
+                    inboxUnread: $loadInboxUnread(),
+                    sourceReady: $source && $this->canSend($project, $source),
+                );
+            },
+            'bounceMetrics' => fn () => $this->bounceMetrics($project),
+            'bounceQueue' => fn () => $this->bounceQueue($project, $request),
+            'emails' => fn () => $loadEmails()->getCollection()
+                ->map(fn (Email $email) => $this->serializeEmail($email, detailed: true, includeBody: false)),
+            'emailPagination' => fn () => [
+                'page' => $loadEmails()->currentPage(),
+                'per_page' => $loadEmails()->perPage(),
+                'from' => $loadEmails()->firstItem(),
+                'to' => $loadEmails()->lastItem(),
+                'has_previous' => $loadEmails()->currentPage() > 1,
+                'has_more' => $loadEmails()->hasMorePages(),
+            ],
+            'emailStatusCounts' => fn () => $section === 'outbound'
+                ? $this->emailStatusCounts($this->activityEmailsQuery($project, $request, $section))
+                : [],
             'selectedEmail' => function () use ($project, $request, $section): ?array {
                 $publicId = $request->string('email')->toString();
                 if ($publicId === '') {
@@ -131,7 +202,7 @@ class ActivityController extends Controller
 
                 return $selected ? $this->serializeEmail($selected, detailed: true, resolveInlineImages: true) : null;
             },
-            'source' => $source ? [
+            'source' => fn () => $source ? [
                 'name' => $source->name,
                 'environment' => $source->environment,
                 'provider' => $source->provider->value,
@@ -149,30 +220,30 @@ class ActivityController extends Controller
                     && app()->environment('production')
                     && blank($source->aws_access_key_id)
                     && blank($source->aws_secret_access_key),
-                'can_send' => $canSend,
+                'can_send' => $this->canSend($project, $source),
                 'capabilities' => $this->sourceCapabilities($source),
             ] : null,
-            'domains' => $project->domains()->latest()->get(['id', 'domain', 'status', 'dns_records', 'verified_at', 'inbound_enabled_at']),
-            'inboundEmails' => $section === 'inbound'
+            'domains' => fn () => $project->domains()->latest()->get(['id', 'domain', 'status', 'dns_records', 'verified_at', 'inbound_enabled_at']),
+            'inboundEmails' => fn () => $section === 'inbound'
                 ? $project->inboundEmails()
                     ->latest('received_at')
                     ->limit(50)
                     ->get(['public_id', 'from_email', 'from_name', 'to_email', 'subject', 'text', 'html', 'attachments', 'received_at'])
                 : [],
-            'templates' => $project->templates()->latest()->get(['slug', 'name', 'subject', 'html', 'text', 'variables', 'updated_at']),
-            'webhooks' => $this->webhookEndpoints($project),
-            'webhookStats' => $this->webhookStats($project),
-            'webhookDeliveries' => $this->webhookDeliveries($project),
-            'suppressions' => $this->suppressions($project),
+            'templates' => fn () => $project->templates()->latest()->get(['slug', 'name', 'subject', 'html', 'text', 'variables', 'updated_at']),
+            'webhooks' => fn () => $this->webhookEndpoints($project),
+            'webhookStats' => fn () => $this->webhookStats($project),
+            'webhookDeliveries' => fn () => $this->webhookDeliveries($project),
+            'suppressions' => fn () => $this->suppressions($project),
             'newWebhookEndpoint' => session('newWebhookEndpoint'),
             'sesWebhookUrl' => $source && $source->provider === SourceProvider::Ses
                 ? route('webhooks.ses', $source->webhook_token)
                 : null,
-            'apiKeys' => $project->apiKeys()->latest()->get(['id', 'name', 'prefix', 'scopes', 'last_used_at', 'last_used_ip', 'last_used_user_agent', 'expires_at', 'created_at']),
+            'apiKeys' => fn () => $project->apiKeys()->latest()->get(['id', 'name', 'prefix', 'scopes', 'last_used_at', 'last_used_ip', 'last_used_user_agent', 'expires_at', 'created_at']),
             'newApiKey' => session('newApiKey'),
             'inboundError' => session('inboundError'),
-            'setup' => $this->setup($project, $source, $context),
-            'sidebarCounts' => [
+            'setup' => fn () => $this->setup($project, $source, $context),
+            'sidebarCounts' => fn () => [
                 'activity' => $project->emails()->count(),
                 'inbound' => $project->inboundEmails()->count(),
                 'sent' => $project->emails()->whereIn('status', ['sent', 'delivered', 'opened', 'clicked'])->count(),
@@ -180,12 +251,13 @@ class ActivityController extends Controller
                 'complaints' => $project->emails()->where('status', 'complained')->count(),
                 'suppressions' => $project->suppressions()->count(),
             ],
-            'inboxUnread' => $this->activeInboxThreads($project)->whereNull('read_at')->count(),
-            'recentThreads' => $section === 'activity'
+            'inboxUnread' => $loadInboxUnread,
+            'recentThreads' => fn () => $section === 'activity'
                 ? $this->activeInboxThreads($project)
+                    ->with('assignedTo:id,name')
                     ->orderByDesc('last_activity_at')
                     ->limit(5)
-                    ->get([
+                    ->select([
                         'public_id',
                         'subject',
                         'participants',
@@ -193,19 +265,18 @@ class ActivityController extends Controller
                         'last_direction',
                         'message_count',
                         'read_at',
+                        'status',
+                        'priority',
+                        'assigned_to_user_id',
                         'last_activity_at',
                     ])
+                    ->withExists(['userStates as is_read_by_user' => fn ($query) => $query->where('user_id', $user->id)->whereNotNull('read_at')])
+                    ->get()
                     ->map(fn (Thread $thread): array => $this->serializeThreadSummary($thread))
                     ->values()
                 : [],
-            'quota' => $this->quota($project, $source),
-            'system' => [
-                'worker_alive' => $this->systemHealth->workerIsAlive(),
-                'worker_last_seen' => $this->systemHealth->workerHeartbeatAt()?->diffForHumans(),
-                'scheduler_alive' => $this->systemHealth->schedulerIsAlive(),
-                'scheduler_last_seen' => $this->systemHealth->schedulerHeartbeatAt()?->diffForHumans(),
-                'stuck_queued' => $this->systemHealth->stuckQueuedEmailCount($project),
-            ],
+            'quota' => $loadQuota,
+            'system' => $loadSystem,
         ]);
     }
 
@@ -377,7 +448,8 @@ class ActivityController extends Controller
     {
         $query = $project->emails()
             ->with(['recipients', 'events', 'attachments', 'source', 'template'])
-            ->latest();
+            ->latest()
+            ->orderByDesc('id');
 
         match ($section) {
             'sent' => $query->whereIn('status', ['sent', 'delivered', 'opened', 'clicked']),
@@ -417,10 +489,21 @@ class ActivityController extends Controller
         return $query;
     }
 
+    /** @return array<string, int> */
+    private function emailStatusCounts(HasMany $query): array
+    {
+        $counts = $query->reorder()->selectRaw('status, count(*) as aggregate')
+            ->groupBy('status')->pluck('aggregate', 'status')
+            ->map(fn ($count): int => (int) $count)->all();
+
+        return ['all' => array_sum($counts), ...$counts];
+    }
+
     private function activeInboxThreads(Project $project): HasMany
     {
         return $project->threads()
             ->whereNull('archived_at')
+            ->where('status', '!=', 'closed')
             ->where(function ($query): void {
                 $query->whereNull('snoozed_until')
                     ->orWhere('snoozed_until', '<=', now());
@@ -439,7 +522,10 @@ class ActivityController extends Controller
             'snippet' => $thread->last_snippet,
             'direction' => $thread->last_direction,
             'message_count' => $thread->message_count,
-            'unread' => $thread->read_at === null,
+            'unread' => ! $thread->is_read_by_user,
+            'status' => $thread->status,
+            'priority' => $thread->priority,
+            'assigned_to' => $thread->assignedTo?->name,
             'last_activity_at' => $thread->last_activity_at?->toIso8601String(),
             'last_activity_human' => $thread->last_activity_at?->diffForHumans(short: true),
         ];
@@ -713,17 +799,25 @@ class ActivityController extends Controller
      */
     private function metricCounts(Project $project, CarbonInterface $start, CarbonInterface $end): array
     {
-        $baseQuery = $project->emails()
+        $counts = $project->emails()
             ->where('created_at', '>=', $start)
-            ->where('created_at', '<=', $end);
+            ->where('created_at', '<=', $end)
+            ->toBase()
+            ->selectRaw('count(*) as sent')
+            ->selectRaw("count(case when status in ('delivered', 'opened', 'clicked') then 1 end) as delivered")
+            ->selectRaw("count(case when status in ('opened', 'clicked') then 1 end) as opened")
+            ->selectRaw("count(case when status = 'clicked' then 1 end) as clicked")
+            ->selectRaw("count(case when status = 'bounced' then 1 end) as bounced")
+            ->selectRaw("count(case when status = 'complained' then 1 end) as complained")
+            ->first();
 
         return [
-            'sent' => (clone $baseQuery)->count(),
-            'delivered' => (clone $baseQuery)->whereIn('status', ['delivered', 'opened', 'clicked'])->count(),
-            'opened' => (clone $baseQuery)->whereIn('status', ['opened', 'clicked'])->count(),
-            'clicked' => (clone $baseQuery)->where('status', 'clicked')->count(),
-            'bounced' => (clone $baseQuery)->where('status', 'bounced')->count(),
-            'complained' => (clone $baseQuery)->where('status', 'complained')->count(),
+            'sent' => (int) $counts->sent,
+            'delivered' => (int) $counts->delivered,
+            'opened' => (int) $counts->opened,
+            'clicked' => (int) $counts->clicked,
+            'bounced' => (int) $counts->bounced,
+            'complained' => (int) $counts->complained,
         ];
     }
 
@@ -788,7 +882,7 @@ class ActivityController extends Controller
     /**
      * @return array<string, mixed>
      */
-    private function serializeEmail(Email $email, bool $detailed = false, bool $resolveInlineImages = false): array
+    private function serializeEmail(Email $email, bool $detailed = false, bool $resolveInlineImages = false, bool $includeBody = true): array
     {
         $toRecipients = $email->recipients->where('type', 'to')->values();
         $ccRecipients = $email->recipients->where('type', 'cc')->values();
@@ -817,8 +911,9 @@ class ActivityController extends Controller
                 'to' => $this->formatRecipients($toRecipients),
                 'cc' => $this->formatRecipients($ccRecipients),
                 'bcc' => $this->formatRecipients($bccRecipients),
-                'html' => $resolveInlineImages ? $this->inlineImages->html($email) : $email->html,
-                'text' => $email->text,
+                'html' => $includeBody ? ($resolveInlineImages ? $this->inlineImages->html($email) : $email->html) : null,
+                'text' => $includeBody ? $email->text : null,
+                'bodyLoaded' => $includeBody,
                 'headers' => $email->headers,
                 'sesMessageId' => $email->ses_message_id,
                 'mimeSize' => $email->mime_size,

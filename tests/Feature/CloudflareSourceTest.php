@@ -54,7 +54,7 @@ it('switches a source to cloudflare without requiring an ses region', function (
             'cloudflare_api_token' => 'cf-test-token',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertRedirect('/source')
         ->assertSessionHasNoErrors();
@@ -81,7 +81,7 @@ it('derives the cloudflare account id from the token when left blank', function 
             'cloudflare_api_token' => 'cf-test-token',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertRedirect('/source')
         ->assertSessionHasNoErrors();
@@ -116,7 +116,7 @@ it('rejects a cloudflare token that cannot access email sending', function () {
             'cloudflare_api_token' => 'cf-no-email-permission',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasErrors('cloudflare_api_token');
 
@@ -145,7 +145,7 @@ it('rejects an invalid cloudflare token at save time', function () {
             'cloudflare_api_token' => 'not-a-real-token',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasErrors('cloudflare_api_token');
 });
@@ -162,7 +162,7 @@ it('requires an api token the first time a source switches to cloudflare', funct
             'cloudflare_account_id' => 'acc-1234567890',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasErrors('cloudflare_api_token');
 });
@@ -186,7 +186,7 @@ it('keeps the stored cloudflare token when the field is left blank', function ()
             'cloudflare_api_token' => '',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasNoErrors();
 
@@ -213,7 +213,7 @@ it('keeps ses credentials when switching a source to cloudflare and back', funct
             'cloudflare_api_token' => 'cf-test-token',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasNoErrors();
 
@@ -230,7 +230,7 @@ it('keeps ses credentials when switching a source to cloudflare and back', funct
             'ses_region' => 'us-east-1',
             'default_from_name' => 'Larasend',
             'default_from_email' => 'receipts@example.com',
-            'retention_days' => 90,
+            'retention_days' => 731,
         ])
         ->assertSessionHasNoErrors();
 

@@ -207,7 +207,6 @@ class DatabaseSeeder extends Seeder
                 'default_from_name' => 'Northwind',
                 'default_from_email' => 'notifications@mail.northwind.io',
                 'webhook_token' => (string) Str::uuid(),
-                'retention_days' => 90,
                 'monthly_quota' => 500000,
                 'max_send_rate' => 200,
                 'last_quota_checked_at' => now(),

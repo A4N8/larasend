@@ -12,6 +12,12 @@ class Source extends Model
 {
     use HasFactory;
 
+    public const MINIMUM_RETENTION_DAYS = 731;
+
+    protected $attributes = [
+        'retention_days' => self::MINIMUM_RETENTION_DAYS,
+    ];
+
     protected $fillable = [
         'project_id',
         'domain_id',
