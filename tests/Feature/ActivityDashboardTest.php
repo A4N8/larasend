@@ -10,6 +10,7 @@ use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
 use App\Support\ProjectContext;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 it('routes incomplete first-run users to onboarding from dashboard', function () {
@@ -406,6 +407,67 @@ it('filters activity by search query and exports csv', function () {
     expect($export->streamedContent())
         ->toContain('Message ID')
         ->toContain('maya.okafor@northwind.io');
+});
+
+it('keeps recipient searches uncorrelated to avoid expensive database plans', function (string $path) {
+    $user = User::factory()->create();
+    seedActivityDashboardData($user);
+
+    DB::enableQueryLog();
+
+    try {
+        $this->actingAs($user)->get($path.'?q=maya')->assertSuccessful();
+
+        $searchQueries = collect(DB::getQueryLog())
+            ->filter(fn (array $query): bool => in_array('%maya%', $query['bindings'], true));
+
+        expect($searchQueries)->not->toBeEmpty();
+
+        foreach ($searchQueries as $query) {
+            expect($query['query'])->not->toContain('exists (select');
+        }
+    } finally {
+        DB::disableQueryLog();
+        DB::flushQueryLog();
+    }
+})->with(['/outbound', '/activity/export']);
+
+it('keeps recipient search results unique and scoped to the selected project', function () {
+    $user = User::factory()->create();
+    $project = seedActivityDashboardData($user);
+    $email = $project->emails()->firstOrFail();
+    $email->recipients()->createMany([
+        ['type' => 'to', 'email' => 'first@example.test', 'name' => 'Shared Search Name'],
+        ['type' => 'cc', 'email' => 'second@example.test', 'name' => 'Shared Search Name'],
+    ]);
+
+    $otherProject = Project::create(['workspace_id' => $project->workspace_id, 'name' => 'Other', 'slug' => 'other-project']);
+    $otherSource = Source::create(['project_id' => $otherProject->id, 'name' => 'Other', 'webhook_token' => 'other-search-source']);
+    $otherEmail = Email::create([
+        'public_id' => 'email_other_search_project',
+        'workspace_id' => $project->workspace_id,
+        'project_id' => $otherProject->id,
+        'source_id' => $otherSource->id,
+        'status' => 'sent',
+        'from_email' => 'sender@example.test',
+        'subject' => 'Other project message',
+    ]);
+    $otherEmail->recipients()->create(['type' => 'to', 'email' => 'other@example.test', 'name' => 'Shared Search Name']);
+
+    $path = '/projects/'.$project->slug;
+    $search = '?q='.urlencode('Shared Search Name');
+
+    $this->actingAs($user)->get($path.'/outbound'.$search)
+        ->assertSuccessful()
+        ->assertInertia(fn ($page) => $page
+            ->has('emails', 1)
+            ->where('emails.0.id', $email->public_id));
+
+    $export = $this->actingAs($user)->get($path.'/activity/export'.$search)
+        ->assertSuccessful()->streamedContent();
+
+    expect(substr_count($export, $email->public_id))->toBe(1)
+        ->and($export)->not->toContain($otherEmail->public_id);
 });
 
 it('allows workspace users to download raw mime content', function () {
