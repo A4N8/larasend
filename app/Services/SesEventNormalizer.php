@@ -196,10 +196,6 @@ class SesEventNormalizer
      */
     private function recordSuppression(Email $email, string $eventType, array $payload, ?string $recipient): void
     {
-        if (! $recipient) {
-            return;
-        }
-
         $reason = match ($eventType) {
             'complaint' => 'complaint',
             'bounce' => $this->isPermanentBounce($payload) ? 'hard_bounce' : null,
@@ -210,20 +206,44 @@ class SesEventNormalizer
             return;
         }
 
-        Suppression::query()->updateOrCreate(
-            [
-                'project_id' => $email->project_id,
-                'email' => $recipient,
-            ],
-            [
+        $detail = $payload[$eventType] ?? $payload[ucfirst($eventType)] ?? [];
+        $recipientKey = $eventType === 'complaint' ? 'complainedRecipients' : 'bouncedRecipients';
+        $recipients = collect($detail[$recipientKey] ?? [['emailAddress' => $recipient]])
+            ->pluck('emailAddress')
+            ->filter(fn (mixed $address): bool => is_string($address) && Suppression::normalizeEmail($address) !== '')
+            ->map(fn (string $address): string => Suppression::normalizeEmail($address))
+            ->uniqueStrict()
+            ->sort(SORT_STRING);
+
+        foreach ($recipients as $address) {
+            $values = [
                 'workspace_id' => $email->workspace_id,
                 'source_id' => $email->source_id,
                 'email_id' => $email->id,
                 'reason' => $reason,
                 'event_type' => $eventType,
                 'expires_at' => null,
-            ],
-        );
+            ];
+            $candidate = Suppression::query()->where('project_id', $email->project_id)
+                ->whereNormalizedEmail($address)
+                ->firstOrCreate([], ['project_id' => $email->project_id, 'email' => $address, ...$values]);
+            $suppression = Suppression::query()->whereKey($candidate->id)->lockForUpdate()->firstOrFail();
+            $isActive = $suppression->expires_at === null || $suppression->expires_at->isFuture();
+            $isOwned = $suppression->source_id === $email->source_id
+                && $suppression->email_id !== null
+                && in_array($suppression->reason, ['hard_bounce', 'complaint'], true)
+                && in_array($suppression->event_type, ['bounce', 'complaint'], true);
+
+            if ($isActive && ! $isOwned) {
+                continue;
+            }
+
+            if ($isActive && $suppression->reason === 'complaint' && $reason !== 'complaint') {
+                continue;
+            }
+
+            $suppression->update($values);
+        }
     }
 
     /**

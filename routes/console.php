@@ -16,7 +16,7 @@ Artisan::command('inspire', function () {
 Schedule::call(fn () => app(SystemHealth::class)->recordSchedulerHeartbeat())
     ->everyTenMinutes()
     ->name('scheduler-heartbeat');
-Schedule::job(new SyncCloudflareSuppressions)->hourly();
+Schedule::job(new SyncCloudflareSuppressions)->hourly()->withoutOverlapping()->onOneServer();
 Schedule::job(new RecheckPendingDomains)->everyTenMinutes()->withoutOverlapping();
 Schedule::job(new SyncStaleSourceQuotas)->everyThirtyMinutes()->withoutOverlapping();
 Schedule::job(new RecoverStuckQueuedEmails)->everyMinute()->withoutOverlapping()->onOneServer();

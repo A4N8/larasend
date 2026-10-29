@@ -87,6 +87,19 @@ class SesV2Client
         return $response->json();
     }
 
+    public function deleteSuppressedDestination(Source $source, string $email): void
+    {
+        $target = "https://email.{$source->ses_region}.amazonaws.com/v2/email/suppression/addresses/".rawurlencode($email);
+        $headers = $this->signedHeaders($source, 'DELETE', $target, '');
+        $response = Http::withHeaders($headers)->connectTimeout(5)->timeout(15)->delete($target);
+
+        if ($response->notFound()) {
+            return;
+        }
+
+        $response->throw();
+    }
+
     /**
      * The explicit Destination is required for Bcc delivery: Symfony Mime
      * strips the Bcc header from the raw message, so SES cannot derive
@@ -141,8 +154,9 @@ class SesV2Client
     {
         $credentials = $this->awsCredentials($source);
         $host = parse_url($url, PHP_URL_HOST);
-        $amzDate = gmdate('Ymd\THis\Z');
-        $date = gmdate('Ymd');
+        $timestamp = now('UTC');
+        $amzDate = $timestamp->format('Ymd\THis\Z');
+        $date = $timestamp->format('Ymd');
         $payloadHash = hash('sha256', $payload);
         $sessionToken = $credentials['session_token'] ?? null;
         $sessionHeader = filled($sessionToken) ? "x-amz-security-token:{$sessionToken}\n" : '';
@@ -152,7 +166,7 @@ class SesV2Client
             : 'content-type;host;x-amz-date';
         $canonicalRequest = implode("\n", [
             $method,
-            parse_url($url, PHP_URL_PATH),
+            implode('/', array_map('rawurlencode', explode('/', parse_url($url, PHP_URL_PATH)))),
             '',
             $canonicalHeaders,
             $signedHeaders,

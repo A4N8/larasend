@@ -191,7 +191,7 @@ class InboxController extends Controller
      */
     private function messagesFor(Thread $thread, Request $request): array
     {
-        $inbound = $thread->inboundEmails()->get()->map(fn (InboundEmail $message): array => [
+        $inbound = $thread->inboundEmails()->oldest('id')->get()->map(fn (InboundEmail $message): array => [
             'id' => $message->public_id,
             'direction' => 'inbound',
             'from' => trim(($message->from_name ? $message->from_name.' ' : '').'<'.$message->from_email.'>'),
@@ -207,7 +207,7 @@ class InboxController extends Controller
             'at_human' => $message->received_at?->diffForHumans(short: true),
         ]);
 
-        $outboundEmails = $thread->emails()->with(['recipients', 'attachments', 'events' => fn ($query) => $query->latest('occurred_at')->limit(1)])->get()->keyBy('public_id');
+        $outboundEmails = $thread->emails()->with(['recipients', 'attachments', 'events' => fn ($query) => $query->latest('occurred_at')->limit(1)])->oldest('id')->get()->keyBy('public_id');
         $outbound = $outboundEmails->map(fn (Email $message): array => [
             'id' => $message->public_id,
             'direction' => 'outbound',
@@ -226,7 +226,7 @@ class InboxController extends Controller
             'at_human' => $message->created_at?->diffForHumans(short: true),
         ]);
 
-        $notes = $thread->notes()->with('user')->get()->map(fn (ThreadNote $note): array => [
+        $notes = $thread->notes()->with('user')->oldest('id')->get()->map(fn (ThreadNote $note): array => [
             'id' => 'note-'.$note->id,
             'direction' => 'note',
             'from' => $note->user?->name ?? 'Someone',

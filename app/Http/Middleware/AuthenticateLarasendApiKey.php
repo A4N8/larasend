@@ -34,7 +34,16 @@ class AuthenticateLarasendApiKey
             return response()->json(['message' => 'Invalid Larasend API key.'], 401);
         }
 
-        $requiredScope = $request->isMethod('post') ? 'send' : 'read:activity';
+        $requiredScope = match ($request->route()?->getName()) {
+            'api.emails.index', 'api.emails.show' => 'read:activity',
+            'api.emails.store' => 'send',
+            'api.suppressions.destroy' => 'manage:suppressions',
+            default => null,
+        };
+
+        if ($requiredScope === null) {
+            return response()->json(['message' => 'This API route has no configured Larasend API key scope.'], 403);
+        }
 
         if (! $apiKey->allows($requiredScope)) {
             return response()->json(['message' => "This Larasend API key is missing the {$requiredScope} scope."], 403);

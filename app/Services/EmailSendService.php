@@ -7,6 +7,7 @@ use App\Jobs\SendQueuedEmail;
 use App\Models\Email;
 use App\Models\Project;
 use App\Models\Source;
+use App\Models\Suppression;
 use App\Models\Template;
 use App\Services\Providers\EmailProviderFactory;
 use Illuminate\Support\Arr;
@@ -235,7 +236,7 @@ class EmailSendService
     {
         $recipients = collect(['to', 'cc', 'bcc'])
             ->flatMap(fn (string $type) => $payload[$type] ?? [])
-            ->map(fn (string $recipient): string => Str::lower($this->mimeBuilder->splitAddress($recipient)['email']))
+            ->map(fn (string $recipient): string => Suppression::normalizeEmail($this->mimeBuilder->splitAddress($recipient)['email']))
             ->filter()
             ->unique()
             ->values();
@@ -245,9 +246,10 @@ class EmailSendService
         }
 
         $suppressed = $project->suppressions()
-            ->whereIn('email', $recipients)
+            ->active()
+            ->whereNormalizedEmailIn($recipients)
             ->pluck('email')
-            ->map(fn (string $email): string => Str::lower($email))
+            ->map(fn (string $email): string => Suppression::normalizeEmail($email))
             ->all();
 
         if ($suppressed === []) {

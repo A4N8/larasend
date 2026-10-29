@@ -55,6 +55,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
         Route::post('api-keys', [DashboardActionController::class, 'storeApiKey'])->name('api-keys.store');
         Route::post('api-keys/{apiKey}/rotate', [DashboardActionController::class, 'rotateApiKey'])->name('api-keys.rotate');
         Route::delete('api-keys/{apiKey}', [DashboardActionController::class, 'destroyApiKey'])->name('api-keys.destroy');
+        Route::delete('suppressions/{suppression}', [DashboardActionController::class, 'destroySuppression'])->name('suppressions.destroy');
         Route::post('webhooks', [DashboardActionController::class, 'storeWebhookEndpoint'])->name('webhooks.store');
         Route::put('webhooks/{endpoint:public_id}', [DashboardActionController::class, 'updateWebhookEndpoint'])->name('webhooks.update');
         Route::post('send', [DashboardActionController::class, 'sendEmail'])->name('send.store');
@@ -90,6 +91,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('bounces', ActivityController::class)->defaults('section', 'bounces')->name('bounces');
     Route::get('complaints', ActivityController::class)->defaults('section', 'complaints')->name('complaints');
     Route::get('suppressions', ActivityController::class)->defaults('section', 'suppressions')->name('suppressions');
+    Route::delete('suppressions/{suppression}', [DashboardActionController::class, 'destroySuppression'])->name('suppressions.destroy');
     Route::get('identities', ActivityController::class)->defaults('section', 'identities')->name('identities');
     Route::get('templates', ActivityController::class)->defaults('section', 'templates')->name('templates');
     Route::get('webhooks', ActivityController::class)->defaults('section', 'webhooks')->name('webhooks');

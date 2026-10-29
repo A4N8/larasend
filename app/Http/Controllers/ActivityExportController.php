@@ -21,6 +21,11 @@ class ActivityExportController extends Controller
             is_string($projectSlug) ? $projectSlug : null,
         );
         $section = (string) $request->query('section', 'activity');
+
+        if ($section === 'suppressions') {
+            return $this->suppressionExport($project, $request);
+        }
+
         $status = strtolower(trim($request->string('status')->toString()));
         $emails = $this->activityEmailsQuery($project, $request, $section)
             ->when($section === 'outbound' && in_array($status, Email::FILTERABLE_STATUSES, true), fn ($query) => $query->where('status', $status))
@@ -33,18 +38,48 @@ class ActivityExportController extends Controller
             foreach ($emails->reorder()->lazyByIdDesc(200) as $email) {
                 $recipient = $email->recipients->firstWhere('type', 'to');
                 fputcsv($handle, [
-                    $email->public_id,
-                    $email->status,
-                    $recipient?->email,
-                    $email->subject,
-                    $email->template?->slug ?? '',
+                    $this->formulaSafe($email->public_id),
+                    $this->formulaSafe($email->status),
+                    $this->formulaSafe($recipient?->email ?? ''),
+                    $this->formulaSafe($email->subject),
+                    $this->formulaSafe($email->template?->slug ?? ''),
                     $email->sent_at?->toIso8601String() ?: $email->created_at->toIso8601String(),
-                    $email->ses_message_id,
+                    $this->formulaSafe($email->ses_message_id ?? ''),
                 ]);
             }
 
             fclose($handle);
         }, 'larasend-activity.csv', ['Content-Type' => 'text/csv']);
+    }
+
+    private function suppressionExport(Project $project, Request $request): StreamedResponse
+    {
+        $search = trim($request->string('q')->toString());
+        $suppressions = $project->suppressions()
+            ->when($search !== '', fn ($query) => $query->whereLike('email', "%{$search}%"));
+
+        return response()->streamDownload(function () use ($suppressions): void {
+            $handle = fopen('php://output', 'w');
+            fputcsv($handle, ['Recipient', 'Reason', 'Source', 'Added at', 'Expires at', 'Status']);
+
+            foreach ($suppressions->lazyByIdDesc(200) as $suppression) {
+                fputcsv($handle, [
+                    $this->formulaSafe($suppression->email),
+                    $this->formulaSafe($suppression->reason),
+                    $this->formulaSafe($suppression->event_type),
+                    $suppression->created_at->toIso8601String(),
+                    $suppression->expires_at?->toIso8601String() ?? '',
+                    $suppression->expires_at === null || $suppression->expires_at->isFuture() ? 'Active' : 'Expired',
+                ]);
+            }
+
+            fclose($handle);
+        }, 'larasend-suppressions.csv', ['Content-Type' => 'text/csv']);
+    }
+
+    private function formulaSafe(string $value): string
+    {
+        return preg_match('/\A[\x00-\x20]*[=+\-@]/', $value) === 1 ? "'{$value}" : $value;
     }
 
     private function activityEmailsQuery(Project $project, Request $request, string $section): HasMany

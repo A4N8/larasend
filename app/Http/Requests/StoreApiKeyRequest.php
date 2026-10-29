@@ -20,7 +20,7 @@ class StoreApiKeyRequest extends FormRequest
         return [
             'name' => ['required', 'string', 'max:255'],
             'scopes' => ['sometimes', 'array', 'min:1'],
-            'scopes.*' => ['required', Rule::in(['send', 'read:activity'])],
+            'scopes.*' => ['required', Rule::in(['send', 'read:activity', 'manage:suppressions'])],
             'expires_at' => ['nullable', 'date', 'after:now'],
         ];
     }

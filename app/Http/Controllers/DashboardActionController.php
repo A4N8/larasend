@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Enums\SourceProvider;
+use App\Exceptions\SuppressionRemovalException;
 use App\Http\Requests\DashboardSendEmailRequest;
 use App\Http\Requests\StoreApiKeyRequest;
 use App\Http\Requests\StoreDomainRequest;
@@ -23,6 +24,7 @@ use App\Services\EmailSendService;
 use App\Services\Providers\CloudflareInboundProvisioner;
 use App\Services\Providers\DomainOnboardingException;
 use App\Services\Providers\EmailProviderFactory;
+use App\Services\SuppressionRemovalService;
 use App\Support\ProjectContext;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -243,11 +245,17 @@ class DashboardActionController extends Controller
         $project = $this->projectFor(Auth::user());
         $this->authorizeWorkspaceCapability($project, 'manage_api_keys');
 
+        $scopes = $request->validated('scopes') ?? ['send', 'read:activity'];
+
+        if (in_array('manage:suppressions', $scopes, true)) {
+            $this->authorizeWorkspaceCapability($project, 'manage_suppressions');
+        }
+
         $issued = ApiKey::issue(
             $project,
             $request->string('name')->toString(),
             $this->sourceFor($project),
-            $request->validated('scopes') ?: ['send', 'read:activity'],
+            $scopes,
             $request->date('expires_at'),
         );
 
@@ -286,11 +294,15 @@ class DashboardActionController extends Controller
         abort_unless($apiKey instanceof ApiKey, 404);
         abort_unless($apiKey->project_id === $project->id, 404);
 
+        if ($apiKey->allows('manage:suppressions')) {
+            $this->authorizeWorkspaceCapability($project, 'manage_suppressions');
+        }
+
         $issued = ApiKey::issue(
             $project,
             $apiKey->name,
             $apiKey->source,
-            $apiKey->scopes ?: ['send', 'read:activity'],
+            $apiKey->scopes ?? ['send', 'read:activity'],
             $apiKey->expires_at,
         );
 
@@ -299,6 +311,25 @@ class DashboardActionController extends Controller
         Inertia::flash('toast', ['type' => 'success', 'message' => 'API key rotated. Copy the new key now.']);
 
         return $this->toProjectSection($project, 'api-keys')->with('newApiKey', $issued['plain_text']);
+    }
+
+    public function destroySuppression(Request $request, SuppressionRemovalService $removalService): RedirectResponse
+    {
+        $project = $this->projectFor(Auth::user());
+        $this->authorizeWorkspaceCapability($project, 'manage_suppressions');
+        $suppression = $project->suppressions()->findOrFail($request->route('suppression'));
+
+        try {
+            $removalService->remove($suppression);
+        } catch (SuppressionRemovalException $exception) {
+            Inertia::flash('toast', ['type' => 'error', 'message' => $exception->getMessage()]);
+
+            return $this->toProjectSection($project, 'suppressions')->withErrors(['suppression' => $exception->getMessage()]);
+        }
+
+        Inertia::flash('toast', ['type' => 'success', 'message' => 'Suppression removed.']);
+
+        return $this->toProjectSection($project, 'suppressions');
     }
 
     public function storeWebhookEndpoint(StoreWebhookEndpointRequest $request): RedirectResponse
@@ -595,6 +626,7 @@ class DashboardActionController extends Controller
             'manage_domains' => $project->workspace->canManageDomains($user),
             'manage_templates' => $project->workspace->canManageTemplates($user),
             'manage_webhooks' => $project->workspace->canManageWebhooks($user),
+            'manage_suppressions' => $project->workspace->canManageSuppressions($user),
             default => false,
         };
 
