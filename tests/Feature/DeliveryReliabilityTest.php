@@ -320,7 +320,7 @@ it('recovers early SES events and downstream dispatch when the SES id is saved a
 });
 
 it('bounds S3 transport attempts within the worker visibility budget without changing disk selection', function (): void {
-    $filesystems = require base_path('config/filesystems.php');
+    $filesystems = config('filesystems');
     expect($filesystems['disks']['s3']['http']['connect_timeout'])->toBe(5.0)
         ->and($filesystems['disks']['s3']['http']['timeout'])->toBe(30.0)
         ->and($filesystems['disks']['s3']['retries'])->toBe(1)
