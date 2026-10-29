@@ -56,6 +56,11 @@ return [
             'url' => env('AWS_URL'),
             'endpoint' => env('AWS_ENDPOINT'),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
+            'retries' => (int) env('AWS_S3_RETRIES', 1),
+            'http' => [
+                'connect_timeout' => (float) env('AWS_S3_CONNECT_TIMEOUT', 5),
+                'timeout' => (float) env('AWS_S3_TIMEOUT', 30),
+            ],
             'throw' => true,
             'report' => false,
         ],

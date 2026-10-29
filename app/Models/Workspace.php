@@ -16,8 +16,8 @@ class Workspace extends Model
      * @var array<string, array<int, string>>
      */
     public const ROLE_CAPABILITIES = [
-        'owner' => ['send', 'manage_api_keys', 'manage_domains', 'manage_templates', 'manage_webhooks', 'manage_members'],
-        'member' => ['send', 'manage_api_keys', 'manage_domains', 'manage_templates', 'manage_webhooks'],
+        'owner' => ['send', 'manage_api_keys', 'manage_domains', 'manage_templates', 'manage_webhooks', 'manage_suppressions', 'manage_members'],
+        'member' => ['send', 'manage_api_keys', 'manage_domains', 'manage_templates', 'manage_webhooks', 'manage_suppressions'],
         'sender' => ['send'],
         'api_keys' => ['manage_api_keys'],
         'domains' => ['manage_domains'],
@@ -101,6 +101,11 @@ class Workspace extends Model
     public function canManageWebhooks(User $user): bool
     {
         return $this->roleAllows($user, 'manage_webhooks');
+    }
+
+    public function canManageSuppressions(User $user): bool
+    {
+        return $this->roleAllows($user, 'manage_suppressions');
     }
 
     private function roleAllows(User $user, string $capability): bool

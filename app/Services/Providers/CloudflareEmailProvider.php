@@ -3,12 +3,14 @@
 namespace App\Services\Providers;
 
 use App\Enums\SourceProvider;
+use App\Exceptions\EmailNotSubmittedException;
 use App\Models\Source;
 use App\Services\CloudflareApiClient;
 use App\Services\MimeMessageBuilder;
 use RuntimeException;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
+use Symfony\Component\Mailer\Exception\UnexpectedResponseException;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\RawMessage;
 use Throwable;
@@ -160,20 +162,26 @@ class CloudflareEmailProvider implements EmailProvider
 
     public function sendRawEmail(Source $source, string $mime, array $envelope): array
     {
-        $sender = $this->mimeBuilder->address($envelope['from']);
-        $recipients = array_map(
-            fn (string $recipient): Address => $this->mimeBuilder->address($recipient),
-            $envelope['recipients'],
-        );
+        try {
+            $sender = $this->mimeBuilder->address($envelope['from']);
+            $recipients = array_map(
+                fn (string $recipient): Address => $this->mimeBuilder->address($recipient),
+                $envelope['recipients'],
+            );
 
-        if ($recipients === []) {
-            throw new RuntimeException('Cannot send: the email has no recipients.');
+            if ($recipients === []) {
+                throw new RuntimeException('Cannot send: the email has no recipients.');
+            }
+
+            $transport = $this->transportFactory->create($source);
+            $message = new RawMessage($mime);
+            $smtpEnvelope = new Envelope($sender, $recipients);
+        } catch (Throwable $exception) {
+            throw new EmailNotSubmittedException($exception->getMessage(), previous: $exception);
         }
 
-        $transport = $this->transportFactory->create($source);
-
         try {
-            $sent = $transport->send(new RawMessage($mime), new Envelope($sender, $recipients));
+            $sent = $transport->send($message, $smtpEnvelope);
         } catch (TransportExceptionInterface $exception) {
             throw $this->mapTransportException($exception, $sender);
         }
@@ -347,26 +355,31 @@ class CloudflareEmailProvider implements EmailProvider
     private function mapTransportException(TransportExceptionInterface $exception, Address $sender): Throwable
     {
         $message = $exception->getMessage();
+        $code = $exception->getCode();
+        $explicitRejection = $exception instanceof UnexpectedResponseException
+            || str_starts_with($message, 'Failed to authenticate on SMTP server ');
 
-        if (str_contains($message, '550') && str_contains($message, '5.7.1')) {
+        if (! $explicitRejection || $code < 400 || $code >= 600) {
+            return $exception;
+        }
+
+        if ($code === 550 && str_contains($message, '5.7.1')) {
             $domain = substr($sender->getAddress(), (int) strrpos($sender->getAddress(), '@') + 1);
 
-            return new RuntimeException(
+            return new EmailNotSubmittedException(
                 "Cloudflare rejected the sender address. Add \"{$domain}\" as a sending domain in Larasend (or onboard it for Email Sending in the Cloudflare dashboard), then try again.",
                 previous: $exception,
             );
         }
 
-        if (str_contains($message, '535')) {
-            return new RuntimeException(
+        if ($code === 535) {
+            return new EmailNotSubmittedException(
                 'Cloudflare rejected the API token over SMTP. Check that the token is valid and has the "Email Sending: Edit" permission.',
                 previous: $exception,
             );
         }
 
-        // Transient failures keep their original type so the queue's
-        // retry/backoff machinery treats them normally.
-        return $exception;
+        return new EmailNotSubmittedException($message, previous: $exception);
     }
 
     private function extractMessageId(string $mime): ?string

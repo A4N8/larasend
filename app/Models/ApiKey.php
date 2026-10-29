@@ -56,7 +56,7 @@ class ApiKey extends Model
 
     public function allows(string $scope): bool
     {
-        // Keys created before scopes existed have a null column and keep full access.
+        // Legacy keys retain send and activity access without gaining new permissions.
         // A present-but-empty array is an explicit grant of no scopes, so it denies everything.
         $scopes = $this->scopes ?? ['send', 'read:activity'];
 

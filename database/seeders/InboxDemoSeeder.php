@@ -10,9 +10,10 @@ use Illuminate\Database\Seeder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use RuntimeException;
 
 /**
- * Seeds a handful of realistic conversations into the first project so the
+ * Seeds a handful of realistic conversations into isolated demo projects so the
  * team inbox can be demoed without waiting for real inbound mail.
  *
  * Run with: php artisan db:seed --class=InboxDemoSeeder
@@ -21,14 +22,25 @@ class InboxDemoSeeder extends Seeder
 {
     public function run(): void
     {
-        $project = Project::query()->orderBy('id')->first();
-
-        if (! $project) {
-            $this->command?->warn('No project found — run the main seeder first.');
-
-            return;
+        if (! app()->environment(['local', 'testing'])) {
+            throw new RuntimeException('Demo seeders are only available in local and testing environments.');
         }
 
+        Project::query()
+            ->whereHas('workspace', fn ($query) => $query
+                ->where('slug', 'larasend-demo')
+                ->whereHas('owner', fn ($query) => $query->where('email', 'demo@larasend.test')))
+            ->each(function (Project $project): void {
+                if ($project->threads()->exists()) {
+                    return;
+                }
+
+                $this->seedProject($project);
+            });
+    }
+
+    private function seedProject(Project $project): void
+    {
         $resolver = app(ThreadResolver::class);
         $owner = $project->workspace->users()->first();
         $inboxAddress = 'support@'.($project->domains()->value('domain') ?: 'example.com');

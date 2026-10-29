@@ -15,6 +15,7 @@ class EmailEvent extends Model
         'source_id',
         'event_type',
         'ses_message_id',
+        'provider_event_id',
         'recipient',
         'url',
         'user_agent',

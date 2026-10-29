@@ -8,6 +8,7 @@ use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Services\DnsRecordVerifier;
 use App\Services\EmailSendService;
+use App\Services\WebhookUrlGuard;
 use App\Support\ProjectContext;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
@@ -15,6 +16,14 @@ use Illuminate\Support\Facades\Storage;
 use ZBateson\MailMimeParser\MailMimeParser;
 
 beforeEach(function (): void {
+    app()->instance(WebhookUrlGuard::class, new class extends WebhookUrlGuard
+    {
+        protected function resolveHost(string $host): array
+        {
+            return ['1.1.1.1'];
+        }
+    });
+
     // Domain rechecks dispatched during these tests run inline on the sync
     // queue; stub the DoH resolvers so no real DNS traffic leaves the suite.
     Http::fake([

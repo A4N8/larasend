@@ -4,6 +4,11 @@ return [
     'api_auth_rate_limit_per_minute' => (int) env('LARASEND_API_AUTH_RATE_LIMIT', 60),
     'api_rate_limit_per_minute' => (int) env('LARASEND_API_RATE_LIMIT', 120),
 
+    'queued_recovery' => [
+        'minimum_age_minutes' => 2,
+        'batch_size' => 500,
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Open Registration

@@ -42,7 +42,7 @@ class InboundEmailIngestor
         try {
             $message = $this->parser->parse($mime, autoClose: true);
 
-            return DB::transaction(function () use ($source, $project, $publicId, $envelopeFrom, $envelopeTo, $mime, $mimeDisk, $mimePath, $message): InboundEmail {
+            $inbound = DB::transaction(function () use ($source, $project, $publicId, $envelopeFrom, $envelopeTo, $mime, $mimeDisk, $mimePath, $message): InboundEmail {
                 $inbound = InboundEmail::create([
                     'public_id' => $publicId,
                     'workspace_id' => $project->workspace_id,
@@ -66,8 +66,6 @@ class InboundEmailIngestor
 
                 $this->threads->attachInbound($inbound);
 
-                DeliverInboundWebhook::dispatch($inbound->id)->afterCommit();
-
                 return $inbound;
             });
         } catch (Throwable $exception) {
@@ -75,6 +73,10 @@ class InboundEmailIngestor
 
             throw $exception;
         }
+
+        DB::afterCommit(fn () => app(WebhookDeliveryService::class)->dispatchJob(new DeliverInboundWebhook($inbound->id)));
+
+        return $inbound;
     }
 
     private function deleteStoredMime(string $disk, string $path): void

@@ -9,8 +9,19 @@ use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
 use App\Services\WebhookDeliveryService;
+use App\Services\WebhookUrlGuard;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+
+beforeEach(function () {
+    app()->instance(WebhookUrlGuard::class, new class extends WebhookUrlGuard
+    {
+        protected function resolveHost(string $host): array
+        {
+            return ['1.1.1.1'];
+        }
+    });
+});
 
 function outboundWebhookFixture(): array
 {

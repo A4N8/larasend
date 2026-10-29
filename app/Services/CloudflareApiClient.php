@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Source;
+use App\Models\Suppression;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
@@ -10,6 +11,10 @@ use RuntimeException;
 
 class CloudflareApiClient
 {
+    public const SUPPRESSION_MAX_DATA_PAGES = 100;
+
+    private const SUPPRESSION_PAGE_SIZE = 100;
+
     /**
      * @return array{value: int|float|null, unit: string|null}
      */
@@ -30,39 +35,163 @@ class CloudflareApiClient
     /**
      * All account-level suppressions, paginated to exhaustion.
      *
-     * @return array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null}>
+     * @return array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}>
      */
     public function listSuppressions(Source $source): array
     {
+        return $this->listSuppressionsUntil($source);
+    }
+
+    /**
+     * @return array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}>
+     */
+    private function listSuppressionsUntil(Source $source, ?float $deadline = null): array
+    {
         $suppressions = [];
-        $page = 1;
+        $cursor = null;
+        $visitedCursors = [];
+        $seenEmails = [];
+        $seenIds = [];
 
-        do {
-            $response = $this->request($source)->get('/email/sending/suppression', [
-                'page' => $page,
-                'per_page' => 100,
-                'order' => 'created_at',
-                'direction' => 'asc',
-            ]);
+        for ($page = 1; $page <= self::SUPPRESSION_MAX_DATA_PAGES; $page++) {
+            [$requestTimeout, $connectTimeout] = $this->suppressionRequestTimeouts($deadline);
+            $query = ['per_page' => self::SUPPRESSION_PAGE_SIZE, 'scope_type' => 'account'];
 
-            $this->ensureSuccessful($response);
-
-            $results = $response->json('result') ?? [];
-
-            foreach ($results as $suppression) {
-                $suppressions[] = [
-                    'id' => (string) ($suppression['id'] ?? ''),
-                    'email' => (string) ($suppression['email'] ?? ''),
-                    'reason' => (string) ($suppression['reason'] ?? ''),
-                    'created_at' => $suppression['created_at'] ?? null,
-                    'expires_at' => $suppression['expires_at'] ?? null,
-                ];
+            if ($cursor !== null) {
+                $query['cursor'] = $cursor;
             }
 
-            $page++;
-        } while ($results !== []);
+            $response = $this->request($source, $requestTimeout, $connectTimeout)
+                ->get('/email/sending/suppressions', $query);
+            $this->ensureWithinSuppressionDeadline($deadline);
+            $this->ensureSuccessful($response);
+            $results = $response->json('result');
+            $pagination = $response->json('result_info');
 
-        return $suppressions;
+            if ($response->json('success') !== true || ! is_array($results) || ! array_is_list($results)
+                || ! is_array($pagination) || ! array_key_exists('next_cursor', $pagination)
+                || (isset($pagination['count']) && $pagination['count'] !== count($results))) {
+                throw new RuntimeException('Cloudflare returned an invalid suppression list response. Local history was preserved.');
+            }
+
+            foreach ($results as $suppression) {
+                $validated = $this->validatedAccountSuppression($suppression);
+
+                if (isset($seenEmails[$validated['email']]) || isset($seenIds[$validated['id']])) {
+                    throw new RuntimeException('Cloudflare returned duplicate account suppression entries. Local history was preserved.');
+                }
+
+                $seenEmails[$validated['email']] = true;
+                $seenIds[$validated['id']] = true;
+                $suppressions[] = $validated;
+            }
+
+            $cursor = $pagination['next_cursor'];
+
+            if ($cursor === null) {
+                return $suppressions;
+            }
+
+            if (! is_string($cursor) || trim($cursor) === '' || strlen($cursor) > 2048 || isset($visitedCursors[$cursor])) {
+                throw new RuntimeException('Cloudflare returned an invalid or repeated suppression cursor. Local history was preserved.');
+            }
+
+            $visitedCursors[$cursor] = true;
+        }
+
+        throw new RuntimeException('Cloudflare suppression pagination exceeded its safe data page limit. Local history was preserved.');
+    }
+
+    /**
+     * @return array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}
+     */
+    private function validatedAccountSuppression(mixed $suppression): array
+    {
+        if (! is_array($suppression) || ! is_string($suppression['id'] ?? null) || trim($suppression['id']) === ''
+            || ! is_string($suppression['email'] ?? null) || strlen($suppression['email']) > 255
+            || filter_var(Suppression::normalizeEmail($suppression['email']), FILTER_VALIDATE_EMAIL) === false
+            || ! is_string($suppression['reason'] ?? null) || ! is_bool($suppression['read_only'] ?? null)
+            || ($suppression['scope'] ?? null) !== ['type' => 'account']
+            || ! array_key_exists('expires_at', $suppression)
+            || ! $this->validSuppressionTimestamp($suppression['expires_at'])
+            || ! $this->validSuppressionTimestamp($suppression['created_at'] ?? null)) {
+            throw new RuntimeException('Cloudflare returned invalid suppression metadata. A complete account snapshot is required; local history was preserved.');
+        }
+
+        return [
+            'id' => $suppression['id'],
+            'email' => Suppression::normalizeEmail($suppression['email']),
+            'reason' => $suppression['reason'],
+            'created_at' => $suppression['created_at'] ?? null,
+            'expires_at' => $suppression['expires_at'],
+            'read_only' => $suppression['read_only'],
+            'scope' => ['type' => 'account'],
+        ];
+    }
+
+    private function validSuppressionTimestamp(mixed $value): bool
+    {
+        if ($value === null) {
+            return true;
+        }
+
+        if (! is_string($value) || preg_match('/\\A\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})\\z/', $value) !== 1) {
+            return false;
+        }
+
+        $parts = date_parse($value);
+
+        return $parts['warning_count'] === 0 && $parts['error_count'] === 0;
+    }
+
+    /**
+     * A bounded, stable account-level snapshot safe for destructive decisions.
+     *
+     * @return array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}>
+     */
+    public function listStableSuppressions(Source $source, float $budgetSeconds): array
+    {
+        if ($budgetSeconds <= 0) {
+            throw new RuntimeException('Cloudflare suppression snapshot requires a positive time budget.');
+        }
+
+        $deadline = $this->monotonicTime() + $budgetSeconds;
+        $previousSnapshot = null;
+
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $snapshot = $this->normalizeSuppressionSnapshot($this->listSuppressionsUntil($source, $deadline));
+
+            if ($previousSnapshot !== null && $snapshot === $previousSnapshot) {
+                $this->ensureWithinSuppressionDeadline($deadline);
+
+                return $snapshot;
+            }
+
+            $previousSnapshot = $snapshot;
+        }
+
+        throw new RuntimeException('Cloudflare suppression data changed during pagination. No destructive changes were made.');
+    }
+
+    /**
+     * @param  array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}>  $suppressions
+     * @return array<int, array{id: string, email: string, reason: string, created_at: string|null, expires_at: string|null, read_only: bool, scope: array{type: string}}>
+     */
+    private function normalizeSuppressionSnapshot(array $suppressions): array
+    {
+        return collect($suppressions)
+            ->map(fn (array $suppression): array => [
+                'id' => trim($suppression['id']),
+                'email' => Suppression::normalizeEmail($suppression['email']),
+                'reason' => trim($suppression['reason']),
+                'created_at' => $suppression['created_at'],
+                'expires_at' => $suppression['expires_at'],
+                'read_only' => $suppression['read_only'],
+                'scope' => $suppression['scope'],
+            ])
+            ->sortBy(fn (array $suppression): string => json_encode($suppression, JSON_THROW_ON_ERROR))
+            ->values()
+            ->all();
     }
 
     /**
@@ -312,12 +441,16 @@ class CloudflareApiClient
         $this->ensureSuccessful($response);
     }
 
-    private function request(Source $source): PendingRequest
-    {
+    private function request(
+        Source $source,
+        float $requestTimeout = 15,
+        float $connectTimeout = 3,
+    ): PendingRequest {
         return Http::withToken((string) $source->cloudflare_api_token)
             ->baseUrl("https://api.cloudflare.com/client/v4/accounts/{$source->cloudflare_account_id}")
             ->acceptJson()
-            ->timeout(15);
+            ->connectTimeout($connectTimeout)
+            ->timeout($requestTimeout);
     }
 
     private function rootRequest(Source $source): PendingRequest
@@ -325,7 +458,40 @@ class CloudflareApiClient
         return Http::withToken((string) $source->cloudflare_api_token)
             ->baseUrl('https://api.cloudflare.com/client/v4')
             ->acceptJson()
+            ->connectTimeout(3)
             ->timeout(15);
+    }
+
+    /**
+     * @return array{float, float}
+     */
+    private function suppressionRequestTimeouts(?float $deadline): array
+    {
+        if ($deadline === null) {
+            return [15.0, 3.0];
+        }
+
+        $remaining = $deadline - $this->monotonicTime();
+
+        if ($remaining <= 0) {
+            throw new RuntimeException('Cloudflare suppression snapshot exceeded its time budget. No destructive changes were made.');
+        }
+
+        $requestTimeout = min(15.0, $remaining);
+
+        return [$requestTimeout, min(3.0, $requestTimeout)];
+    }
+
+    private function ensureWithinSuppressionDeadline(?float $deadline): void
+    {
+        if ($deadline !== null && $this->monotonicTime() >= $deadline) {
+            throw new RuntimeException('Cloudflare suppression snapshot exceeded its time budget. No destructive changes were made.');
+        }
+    }
+
+    protected function monotonicTime(): float
+    {
+        return hrtime(true) / 1_000_000_000;
     }
 
     private function ensureSuccessful(Response $response): void

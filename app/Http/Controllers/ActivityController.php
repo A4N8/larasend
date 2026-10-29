@@ -105,6 +105,15 @@ class ActivityController extends Controller
             return $inboxUnread ??= $this->activeInboxThreads($project)
                 ->whereDoesntHave('userStates', fn ($query) => $query->where('user_id', $user->id)->whereNotNull('read_at'))->count();
         };
+        $suppressionPage = null;
+        $loadSuppressions = function () use (&$suppressionPage, $project, $request, $section): Paginator {
+            return $suppressionPage ??= $project->suppressions()
+                ->with('source:id,provider')
+                ->when(trim($request->string('q')->toString()) !== '', fn ($query) => $query
+                    ->whereLike('email', '%'.trim($request->string('q')->toString()).'%'))
+                ->latest()->orderByDesc('id')
+                ->simplePaginate(100, ['*'], 'page', $section === 'suppressions' ? max(1, $request->integer('page', 1)) : 1);
+        };
 
         return Inertia::render('Activity', [
             'project' => [
@@ -123,6 +132,7 @@ class ActivityController extends Controller
                 'can_manage_members' => $project->workspace->canManageMembers($user),
                 'can_manage_api_keys' => $project->workspace->canManageApiKeys($user),
                 'can_manage_domains' => $project->workspace->canManageDomains($user),
+                'can_manage_suppressions' => $project->workspace->canManageSuppressions($user),
                 'can_send' => $project->workspace->canSendEmail($user),
             ],
             'workspaceMembers' => fn () => $this->workspaceMembers($project),
@@ -234,7 +244,15 @@ class ActivityController extends Controller
             'webhooks' => fn () => $this->webhookEndpoints($project),
             'webhookStats' => fn () => $this->webhookStats($project),
             'webhookDeliveries' => fn () => $this->webhookDeliveries($project),
-            'suppressions' => fn () => $this->suppressions($project),
+            'suppressions' => fn () => $this->suppressions($loadSuppressions()),
+            'suppressionPagination' => fn () => [
+                'page' => $loadSuppressions()->currentPage(),
+                'from' => $loadSuppressions()->firstItem(),
+                'to' => $loadSuppressions()->lastItem(),
+                'has_previous' => $loadSuppressions()->currentPage() > 1,
+                'has_more' => $loadSuppressions()->hasMorePages(),
+            ],
+            'suppressionStats' => fn () => $this->suppressionStats($project),
             'newWebhookEndpoint' => session('newWebhookEndpoint'),
             'sesWebhookUrl' => $source && $source->provider === SourceProvider::Ses
                 ? route('webhooks.ses', $source->webhook_token)
@@ -249,7 +267,7 @@ class ActivityController extends Controller
                 'sent' => $project->emails()->whereIn('status', ['sent', 'delivered', 'opened', 'clicked'])->count(),
                 'bounces' => $project->emails()->where('status', 'bounced')->count(),
                 'complaints' => $project->emails()->where('status', 'complained')->count(),
-                'suppressions' => $project->suppressions()->count(),
+                'suppressions' => $project->suppressions()->active()->count(),
             ],
             'inboxUnread' => $loadInboxUnread,
             'recentThreads' => fn () => $section === 'activity'
@@ -629,21 +647,34 @@ class ActivityController extends Controller
     /**
      * @return array<int, array<string, mixed>>
      */
-    private function suppressions(Project $project): array
+    private function suppressions(Paginator $page): array
     {
-        return $project->suppressions()
-            ->latest()
-            ->limit(100)
-            ->get()
+        return $page->getCollection()
             ->map(fn (Suppression $suppression): array => [
                 'id' => $suppression->id,
                 'email' => $suppression->email,
                 'reason' => $suppression->reason,
                 'source' => $suppression->event_type,
+                'provider' => $suppression->source?->provider?->value,
                 'added' => $suppression->created_at->diffForHumans(short: true),
                 'expires' => $suppression->expires_at?->toDateString() ?? 'Never',
+                'active' => $suppression->expires_at === null || $suppression->expires_at->isFuture(),
+                'expires_at' => $suppression->expires_at?->toIso8601String(),
             ])
             ->all();
+    }
+
+    /** @return array{active: int, hard_bounce: int, complaint: int, expired: int} */
+    private function suppressionStats(Project $project): array
+    {
+        $activeCounts = $project->suppressions()->active()->select('reason')->selectRaw('COUNT(*) as total')->groupBy('reason')->pluck('total', 'reason');
+
+        return [
+            'active' => (int) $activeCounts->sum(),
+            'hard_bounce' => (int) $activeCounts->get('hard_bounce', 0),
+            'complaint' => (int) $activeCounts->get('complaint', 0),
+            'expired' => $project->suppressions()->whereNotNull('expires_at')->where('expires_at', '<=', now())->count(),
+        ];
     }
 
     /**

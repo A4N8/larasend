@@ -2,8 +2,12 @@
 
 namespace App\Services;
 
+use App\Jobs\DeliverInboundWebhook;
 use App\Jobs\DeliverWebhook;
 use App\Models\EmailEvent;
+use Illuminate\Bus\UniqueLock;
+use Illuminate\Contracts\Cache\Repository;
+use Throwable;
 
 class WebhookDeliveryService
 {
@@ -20,7 +24,18 @@ class WebhookDeliveryService
             ->where('status', 'active')
             ->whereJsonContains('events', $event->event_type)
             ->each(function ($endpoint) use ($event): void {
-                DeliverWebhook::dispatch($endpoint->id, $event->id);
+                $this->dispatchJob(new DeliverWebhook($endpoint->id, $event->id));
             });
+    }
+
+    public function dispatchJob(DeliverWebhook|DeliverInboundWebhook $job): void
+    {
+        try {
+            dispatch($job);
+        } catch (Throwable $exception) {
+            (new UniqueLock(app(Repository::class)))->release($job);
+
+            throw $exception;
+        }
     }
 }
