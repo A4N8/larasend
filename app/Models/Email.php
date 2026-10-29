@@ -15,6 +15,8 @@ class Email extends Model
 
     protected $fillable = [
         'public_id',
+        'idempotency_key',
+        'idempotency_hash',
         'workspace_id',
         'project_id',
         'source_id',

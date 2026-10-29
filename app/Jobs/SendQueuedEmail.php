@@ -3,20 +3,31 @@
 namespace App\Jobs;
 
 use App\Events\EmailActivityUpdated;
+use App\Exceptions\EmailNotSubmittedException;
 use App\Models\Email;
+use App\Models\EmailEvent;
 use App\Services\Providers\EmailProviderFactory;
+use App\Services\SesEventNormalizer;
+use Illuminate\Bus\UniqueLock;
+use Illuminate\Contracts\Cache\Repository;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use RuntimeException;
 use Throwable;
 
-class SendQueuedEmail implements ShouldQueue
+class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
 {
     use Queueable;
 
     public int $tries = 3;
 
-    public int $timeout = 30;
+    public int $timeout = 120;
+
+    public int $uniqueFor = 3600;
 
     /**
      * @return array<int, int>
@@ -28,51 +39,112 @@ class SendQueuedEmail implements ShouldQueue
 
     public function __construct(public int $emailId) {}
 
+    public function uniqueId(): string
+    {
+        return (string) $this->emailId;
+    }
+
+    public static function dispatchAfterCommit(int $emailId): void
+    {
+        DB::afterCommit(static function () use ($emailId): void {
+            $job = new self($emailId);
+
+            try {
+                dispatch($job)->beforeCommit();
+            } catch (Throwable $exception) {
+                (new UniqueLock(app(Repository::class)))->release($job);
+
+                throw $exception;
+            }
+        });
+    }
+
     public function handle(EmailProviderFactory $providers): void
     {
-        $email = Email::query()->with(['source', 'recipients'])->findOrFail($this->emailId);
+        $email = Email::query()->with(['project', 'source', 'recipients'])->findOrFail($this->emailId);
 
-        // 'sending' is allowed through so a retry can recover an email whose
-        // previous attempt died mid-flight (worker crash, timeout).
-        if (! in_array($email->status, ['queued', 'sending'], true)) {
+        if ($email->status !== 'queued') {
+            app(SesEventNormalizer::class)->reconcile($email);
+
             return;
         }
 
-        $email->forceFill(['status' => 'sending'])->save();
-        EmailActivityUpdated::dispatch($email->fresh());
+        if ($email->project->archived_at !== null) {
+            $this->failed(new RuntimeException('Project was archived before this message could be sent.'));
 
-        try {
-            $mime = $email->mime_path && Storage::disk($email->mime_disk)->exists($email->mime_path)
-                ? Storage::disk($email->mime_disk)->get($email->mime_path)
-                : null;
+            return;
+        }
 
-            if (! is_string($mime) || $mime === '') {
-                throw new \RuntimeException("Stored MIME content is missing for {$email->public_id}.");
+        $mime = $email->mime_path
+            ? Storage::disk($email->mime_disk)->get($email->mime_path)
+            : null;
+
+        if (! is_string($mime) || $mime === '') {
+            throw new RuntimeException("Stored MIME content is missing for {$email->public_id}.");
+        }
+
+        $provider = $providers->forSource($email->source);
+        $envelope = $this->envelope($email);
+
+        $submission = DB::transaction(function () use ($email): ?EmailEvent {
+            if (Email::query()->whereKey($email->id)->where('status', 'queued')->update(['status' => 'sending']) !== 1) {
+                return null;
             }
 
-            $result = $providers->forSource($email->source)->sendRawEmail($email->source, $mime, $this->envelope($email));
+            return $email->events()->create([
+                'source_id' => $email->source_id,
+                'event_type' => 'submission_started',
+                'payload' => ['message' => 'Submission is in progress. If sending persists after the worker stops, check provider delivery records before retrying manually.'],
+                'occurred_at' => now(),
+            ]);
+        });
+
+        if ($submission === null) {
+            return;
+        }
+
+        try {
+            $result = $provider->sendRawEmail($email->source, $mime, $envelope);
         } catch (Throwable $exception) {
-            // Stay in 'sending' so the queue's remaining attempts get past the
-            // status guard above; failed() marks it failed after the last one.
+            $definitelyNotSubmitted = $exception instanceof EmailNotSubmittedException
+                || ($exception instanceof RequestException && $exception->response->clientError());
+
+            if ($definitelyNotSubmitted) {
+                Email::query()->whereKey($email->id)->where('status', 'sending')->update(['status' => 'queued']);
+            }
+
+            $submission->forceFill([
+                'event_type' => $definitelyNotSubmitted ? 'submission_rejected' : 'delivery_uncertain',
+                'payload' => [
+                    'error' => $exception->getMessage(),
+                    'message' => $definitelyNotSubmitted
+                        ? 'No message was accepted by the provider. This email can be retried safely.'
+                        : 'The provider may have accepted this email. Check provider delivery records before retrying manually.',
+                ],
+            ])->save();
+
             EmailActivityUpdated::dispatch($email->fresh());
 
             throw $exception;
         }
 
-        $email->forceFill([
-            'status' => 'sent',
-            'ses_message_id' => $result['message_id'],
-            'sent_at' => now(),
-        ])->save();
+        DB::transaction(function () use ($email, $result, $submission): void {
+            $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
+            $lockedEmail->forceFill([
+                'status' => $lockedEmail->status === 'sending' ? 'sent' : $lockedEmail->status,
+                'ses_message_id' => $result['message_id'],
+                'sent_at' => now(),
+            ])->save();
 
-        $email->events()->create([
-            'source_id' => $email->source_id,
-            'event_type' => 'send',
-            'ses_message_id' => $result['message_id'],
-            'payload' => $result['response'],
-            'occurred_at' => now(),
-        ]);
+            $submission->forceFill([
+                'event_type' => 'send',
+                'ses_message_id' => $result['message_id'],
+                'payload' => $result['response'],
+                'occurred_at' => now(),
+            ])->save();
+        });
 
+        app(SesEventNormalizer::class)->reconcile($email->fresh());
         EmailActivityUpdated::dispatch($email->fresh());
     }
 
@@ -104,7 +176,9 @@ class SendQueuedEmail implements ShouldQueue
             return;
         }
 
-        $email->forceFill(['status' => 'failed'])->save();
+        if (Email::query()->whereKey($email->id)->where('status', 'queued')->update(['status' => 'failed']) !== 1) {
+            return;
+        }
 
         $email->events()->create([
             'source_id' => $email->source_id,

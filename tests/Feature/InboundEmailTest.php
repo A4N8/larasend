@@ -8,6 +8,7 @@ use App\Models\User;
 use App\Models\WebhookEndpoint;
 use App\Models\Workspace;
 use App\Services\ThreadResolver;
+use App\Services\WebhookUrlGuard;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
@@ -173,6 +174,14 @@ it('rejects invalid base64 payloads', function () {
 });
 
 it('fans inbound emails out to subscribed webhook endpoints with signatures', function () {
+    app()->instance(WebhookUrlGuard::class, new class extends WebhookUrlGuard
+    {
+        protected function resolveHost(string $host): array
+        {
+            return ['1.1.1.1'];
+        }
+    });
+
     [, , $project, $source] = inboundProjectFixture();
 
     $issued = WebhookEndpoint::issue($project, 'https://customer.test/hooks', ['inbound.received']);

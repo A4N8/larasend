@@ -2,21 +2,29 @@
 
 namespace App\Jobs;
 
+use App\Exceptions\UnsafeWebhookUrlException;
+use App\Exceptions\WebhookDnsResolutionException;
 use App\Models\InboundEmail;
 use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
+use App\Services\WebhookDeliveryService;
+use App\Services\WebhookUrlGuard;
+use GuzzleHttp\Handler\CurlHandler;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use RuntimeException;
+use Throwable;
 
 /**
  * Fans an inbound email out to every active endpoint subscribed to the
  * "inbound.received" event, using the same signature scheme and delivery
  * records as outbound event webhooks.
  */
-class DeliverInboundWebhook implements ShouldQueue
+class DeliverInboundWebhook implements ShouldBeUnique, ShouldQueue
 {
     use Queueable;
 
@@ -26,6 +34,8 @@ class DeliverInboundWebhook implements ShouldQueue
 
     public int $timeout = 30;
 
+    public int $uniqueFor = 600;
+
     /**
      * @return array<int, int>
      */
@@ -34,9 +44,17 @@ class DeliverInboundWebhook implements ShouldQueue
         return [5, 30, 120];
     }
 
-    public function __construct(public int $inboundEmailId) {}
+    public function __construct(
+        public int $inboundEmailId,
+        public ?int $webhookEndpointId = null,
+    ) {}
 
-    public function handle(): void
+    public function uniqueId(): string
+    {
+        return $this->inboundEmailId.':'.($this->webhookEndpointId ?? 'fanout');
+    }
+
+    public function handle(WebhookUrlGuard $urlGuard): void
     {
         $inbound = InboundEmail::query()->with(['project', 'thread'])->find($this->inboundEmailId);
 
@@ -44,26 +62,66 @@ class DeliverInboundWebhook implements ShouldQueue
             return;
         }
 
-        $inbound->project
+        if ($this->webhookEndpointId === null) {
+            $inbound->project->webhookEndpoints()
+                ->where('status', 'active')
+                ->whereJsonContains('events', self::EVENT_TYPE)
+                ->pluck('id')
+                ->each(fn (int $endpointId) => app(WebhookDeliveryService::class)->dispatchJob(
+                    (new self($inbound->id, $endpointId))->onConnection($this->connection)->onQueue($this->queue),
+                ));
+
+            return;
+        }
+
+        $endpoint = $inbound->project
             ->webhookEndpoints()
+            ->whereKey($this->webhookEndpointId)
             ->where('status', 'active')
             ->whereJsonContains('events', self::EVENT_TYPE)
-            ->each(function (WebhookEndpoint $endpoint) use ($inbound): void {
-                $this->deliver($endpoint, $inbound);
-            });
+            ->first();
+
+        if (! $endpoint) {
+            return;
+        }
+
+        if ($endpoint->deliveries()->where('status', 'ok')->where('payload->id', 'evt_inbound_'.$inbound->id)->exists()) {
+            return;
+        }
+
+        $this->deliver($endpoint, $inbound, $urlGuard);
     }
 
-    private function deliver(WebhookEndpoint $endpoint, InboundEmail $inbound): void
+    private function deliver(WebhookEndpoint $endpoint, InboundEmail $inbound, WebhookUrlGuard $urlGuard): void
     {
         $payload = $this->payload($inbound);
         $body = json_encode($payload, JSON_THROW_ON_ERROR);
         $startedAt = hrtime(true);
 
         try {
+            $requestOptions = $urlGuard->requestOptions($endpoint->url);
+        } catch (UnsafeWebhookUrlException|WebhookDnsResolutionException $exception) {
+            $this->recordDelivery($endpoint, $payload, 'fail', null, 0, $exception->getMessage());
+
+            if ($exception instanceof UnsafeWebhookUrlException) {
+                $endpoint->forceFill(['status' => 'paused'])->save();
+
+                return;
+            }
+
+            $this->releaseForRetry($exception->getMessage());
+
+            return;
+        }
+
+        try {
             $response = Http::withHeaders($this->headers($endpoint, $inbound, $body))
+                ->setHandler(new CurlHandler)
+                ->withOptions($requestOptions)
                 ->acceptJson()
                 ->connectTimeout(5)
                 ->timeout(10)
+                ->withoutRedirecting()
                 ->withBody($body, 'application/json')
                 ->post($endpoint->url);
 
@@ -78,7 +136,11 @@ class DeliverInboundWebhook implements ShouldQueue
 
             if ($response->successful()) {
                 $endpoint->forceFill(['last_delivered_at' => $delivery->delivered_at])->save();
+
+                return;
             }
+
+            $this->releaseForRetry("Webhook endpoint returned HTTP {$response->status()}.");
         } catch (ConnectionException $exception) {
             $this->recordDelivery(
                 endpoint: $endpoint,
@@ -88,6 +150,8 @@ class DeliverInboundWebhook implements ShouldQueue
                 latencyMs: $this->latencyMs($startedAt),
                 responseBody: Str::limit($exception->getMessage(), 2000, ''),
             );
+
+            $this->releaseForRetry($exception->getMessage());
         }
     }
 
@@ -162,5 +226,24 @@ class DeliverInboundWebhook implements ShouldQueue
     private function latencyMs(int $startedAt): int
     {
         return (int) round((hrtime(true) - $startedAt) / 1_000_000);
+    }
+
+    private function releaseForRetry(string $reason): void
+    {
+        $attempt = max($this->attempts() - 1, 0);
+        $delay = $this->backoff()[$attempt] ?? last($this->backoff());
+
+        if ($this->attempts() < $this->tries) {
+            $this->release($delay);
+
+            return;
+        }
+
+        throw new RuntimeException($reason);
+    }
+
+    public function failed(Throwable $exception): void
+    {
+        report($exception);
     }
 }

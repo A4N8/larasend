@@ -1,6 +1,7 @@
 <?php
 
 use App\Jobs\RecheckPendingDomains;
+use App\Jobs\RecoverStuckQueuedEmails;
 use App\Jobs\SyncCloudflareSuppressions;
 use App\Jobs\SyncStaleSourceQuotas;
 use App\Support\SystemHealth;
@@ -18,3 +19,4 @@ Schedule::call(fn () => app(SystemHealth::class)->recordSchedulerHeartbeat())
 Schedule::job(new SyncCloudflareSuppressions)->hourly();
 Schedule::job(new RecheckPendingDomains)->everyTenMinutes()->withoutOverlapping();
 Schedule::job(new SyncStaleSourceQuotas)->everyThirtyMinutes()->withoutOverlapping();
+Schedule::job(new RecoverStuckQueuedEmails)->everyMinute()->withoutOverlapping()->onOneServer();

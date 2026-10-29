@@ -28,7 +28,7 @@ class EmailSendService
     /**
      * @param  array<string, mixed>  $payload
      */
-    public function send(Project $project, ?Source $source, array $payload): Email
+    public function send(Project $project, ?Source $source, array $payload, ?string $idempotencyKey = null, ?string $idempotencyHash = null): Email
     {
         $source ??= $project->sources()->where('environment', $project->default_environment)->firstOrFail();
         $template = $this->resolveTemplate($project, $payload);
@@ -37,7 +37,7 @@ class EmailSendService
         $this->ensureSourceCanSend($project, $source, (string) $from);
         $this->ensureRecipientsAreSendable($project, $payload);
 
-        return DB::transaction(function () use ($project, $source, $payload, $template, $from) {
+        $email = DB::transaction(function () use ($project, $source, $payload, $template, $from, $idempotencyKey, $idempotencyHash) {
             $publicId = 'email_'.Str::random(24);
             $mime = $this->mimeBuilder->build(
                 from: $from,
@@ -64,6 +64,8 @@ class EmailSendService
 
                 $email = Email::create([
                     'public_id' => $publicId,
+                    'idempotency_key' => $idempotencyKey,
+                    'idempotency_hash' => $idempotencyHash,
                     'workspace_id' => $project->workspace_id,
                     'project_id' => $project->id,
                     'source_id' => $source->id,
@@ -106,7 +108,6 @@ class EmailSendService
                 $this->threads->attachOutbound($email);
 
                 EmailActivityUpdated::dispatch($email);
-                SendQueuedEmail::dispatch($email->id)->afterCommit();
 
                 return $email->load(['recipients', 'events', 'attachments', 'source', 'template']);
             } catch (Throwable $exception) {
@@ -115,6 +116,10 @@ class EmailSendService
                 throw $exception;
             }
         });
+
+        SendQueuedEmail::dispatchAfterCommit($email->id);
+
+        return $email;
     }
 
     private function deleteStoredMime(string $disk, string $path): void

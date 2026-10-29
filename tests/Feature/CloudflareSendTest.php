@@ -13,6 +13,7 @@ use App\Services\Providers\EmailProviderFactory;
 use Illuminate\Support\Facades\Queue;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Exception\TransportException;
+use Symfony\Component\Mailer\Exception\UnexpectedResponseException;
 use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\TransportInterface;
 use Symfony\Component\Mime\RawMessage;
@@ -144,8 +145,9 @@ it('maps cloudflare smtp sender rejections to an actionable setup error', functi
     ])->assertAccepted();
 
     $email = Email::query()->firstOrFail();
-    $spy->failWith = new TransportException(
+    $spy->failWith = new UnexpectedResponseException(
         'Expected response code "354" but got code "550", with message "550 5.7.1 Sender denied".',
+        550,
     );
 
     $job = new SendQueuedEmail($email->id);
@@ -159,7 +161,7 @@ it('maps cloudflare smtp sender rejections to an actionable setup error', functi
 
     expect($caught)->not->toBeNull()
         ->and($caught->getMessage())->toContain('Add "example.com" as a sending domain')
-        ->and($email->fresh()->status)->toBe('sending');
+        ->and($email->fresh()->status)->toBe('queued');
 
     $job->failed($caught);
 
@@ -187,6 +189,23 @@ it('rethrows transient cloudflare smtp failures so the queue can retry', functio
 
     expect($email->fresh()->status)->toBe('sending');
 });
+
+it('distinguishes explicit smtp rejections from ambiguous transport failures', function (TransportException $failure, string $status): void {
+    [, , , $token, $spy] = cloudflareProjectFixture();
+    Queue::fake();
+    $this->withToken($token)->postJson('/api/emails', [
+        'from' => 'receipts@example.com', 'to' => ['maya@example.com'], 'subject' => 'SMTP rejection safety', 'text' => 'Hello',
+    ])->assertAccepted();
+    $email = Email::query()->sole();
+    $spy->failWith = $failure;
+    expect(fn () => (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class)))->toThrow(RuntimeException::class);
+    expect($email->fresh()->status)->toBe($status);
+})->with([
+    'explicit temporary SMTP rejection' => [new UnexpectedResponseException('Temporary submission rejection', 450), 'queued'],
+    'explicit authentication rejection' => [new TransportException('Failed to authenticate on SMTP server with username "api_token".', 535), 'queued'],
+    'socket timeout' => [new TransportException('Connection timed out after DATA.'), 'sending'],
+    'arbitrary transcript containing a rejection code' => [new TransportException('Connection closed; previous transcript mentioned 550 5.7.1.', 550), 'sending'],
+]);
 
 it('redacts smtp auth credentials from stored transcripts', function () {
     $provider = app(CloudflareEmailProvider::class);

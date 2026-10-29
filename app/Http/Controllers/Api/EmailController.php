@@ -4,10 +4,13 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\SendEmailRequest;
+use App\Jobs\SendQueuedEmail;
+use App\Models\ApiKey;
 use App\Models\Email;
 use App\Models\Project;
 use App\Models\Source;
 use App\Services\EmailSendService;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -42,12 +45,77 @@ class EmailController extends Controller
         /** @var Source|null $source */
         $source = $request->attributes->get('larasend_source');
 
-        $email = $emailSendService->send($project, $source, $request->validated());
+        $payload = $request->validated();
+        $clientKey = trim((string) $request->header('Idempotency-Key', ''));
+
+        if (strlen($clientKey) > 255) {
+            return response()->json(['message' => 'The Idempotency-Key header may not exceed 255 bytes.'], 422);
+        }
+
+        $idempotencyKey = null;
+        $idempotencyHash = null;
+
+        if ($clientKey !== '') {
+            /** @var ApiKey $apiKey */
+            $apiKey = $request->attributes->get('larasend_api_key');
+            $source ??= $project->sources()->where('environment', $project->default_environment)->firstOrFail();
+            $idempotencyKey = hash('sha256', json_encode([$apiKey->id, $source->id, $clientKey], JSON_THROW_ON_ERROR));
+            $idempotencyHash = hash('sha256', json_encode($this->canonicalPayload($payload), JSON_THROW_ON_ERROR));
+            $existing = $project->emails()->where('idempotency_key', $idempotencyKey)->first();
+
+            if ($existing) {
+                return $this->replay($existing, $idempotencyHash);
+            }
+        }
+
+        try {
+            $email = $emailSendService->send($project, $source, $payload, $idempotencyKey, $idempotencyHash);
+        } catch (UniqueConstraintViolationException $exception) {
+            $existing = $idempotencyKey === null ? null : $project->emails()->where('idempotency_key', $idempotencyKey)->first();
+
+            if (! $existing) {
+                throw $exception;
+            }
+
+            return $this->replay($existing, $idempotencyHash);
+        }
 
         return response()->json([
             'id' => $email->public_id,
             'object' => 'email',
         ], 202);
+    }
+
+    private function replay(Email $email, string $idempotencyHash): JsonResponse
+    {
+        if (! hash_equals((string) $email->idempotency_hash, $idempotencyHash)) {
+            return response()->json(['message' => 'This Idempotency-Key was already used with a different request.'], 409);
+        }
+
+        if ($email->status === 'queued') {
+            SendQueuedEmail::dispatchAfterCommit($email->id);
+        }
+
+        return response()->json(['id' => $email->public_id, 'object' => 'email', 'replayed' => true], 202);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $payload
+     * @return array<array-key, mixed>
+     */
+    private function canonicalPayload(array $payload): array
+    {
+        if (! array_is_list($payload)) {
+            ksort($payload);
+        }
+
+        foreach ($payload as $key => $value) {
+            if (is_array($value)) {
+                $payload[$key] = $this->canonicalPayload($value);
+            }
+        }
+
+        return $payload;
     }
 
     public function show(Request $request, string $email): JsonResponse

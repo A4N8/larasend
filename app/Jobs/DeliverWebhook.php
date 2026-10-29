@@ -2,23 +2,36 @@
 
 namespace App\Jobs;
 
+use App\Exceptions\UnsafeWebhookUrlException;
+use App\Exceptions\WebhookDnsResolutionException;
 use App\Models\EmailEvent;
 use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
+use App\Services\WebhookUrlGuard;
+use GuzzleHttp\Handler\CurlHandler;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use RuntimeException;
 use Throwable;
 
-class DeliverWebhook implements ShouldQueue
+class DeliverWebhook implements ShouldBeUnique, ShouldQueue
 {
     use Queueable;
 
     public int $tries = 3;
 
     public int $timeout = 20;
+
+    public int $uniqueFor = 600;
+
+    public function uniqueId(): string
+    {
+        return $this->webhookEndpointId.':'.$this->emailEventId;
+    }
 
     /**
      * @return array<int, int>
@@ -39,7 +52,7 @@ class DeliverWebhook implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(): void
+    public function handle(WebhookUrlGuard $urlGuard): void
     {
         $endpoint = WebhookEndpoint::query()->find($this->webhookEndpointId);
         $event = EmailEvent::query()
@@ -54,16 +67,43 @@ class DeliverWebhook implements ShouldQueue
             return;
         }
 
+        if ($endpoint->project_id !== $event->email?->project_id) {
+            return;
+        }
+
+        if ($endpoint->deliveries()->where('status', 'ok')->where('payload->id', 'evt_'.$event->id)->exists()) {
+            return;
+        }
+
         $payload = $this->payload($event);
         $body = json_encode($payload, JSON_THROW_ON_ERROR);
         $startedAt = hrtime(true);
 
         try {
+            $requestOptions = $urlGuard->requestOptions($endpoint->url);
+        } catch (UnsafeWebhookUrlException|WebhookDnsResolutionException $exception) {
+            $this->recordDelivery($endpoint, $event, $payload, 'fail', null, 0, $exception->getMessage());
+
+            if ($exception instanceof UnsafeWebhookUrlException) {
+                $endpoint->forceFill(['status' => 'paused'])->save();
+
+                return;
+            }
+
+            $this->releaseForRetry($exception->getMessage());
+
+            return;
+        }
+
+        try {
             $response = Http::withHeaders($this->headers($endpoint, $event, $body))
+                ->setHandler(new CurlHandler)
+                ->withOptions($requestOptions)
                 ->acceptJson()
                 ->asJson()
                 ->connectTimeout(5)
                 ->timeout(10)
+                ->withoutRedirecting()
                 ->withBody($body, 'application/json')
                 ->post($endpoint->url);
 
@@ -85,7 +125,7 @@ class DeliverWebhook implements ShouldQueue
                 return;
             }
 
-            $this->releaseForRetry();
+            $this->releaseForRetry("Webhook endpoint returned HTTP {$response->status()}.");
         } catch (ConnectionException $exception) {
             $this->recordDelivery(
                 endpoint: $endpoint,
@@ -97,7 +137,7 @@ class DeliverWebhook implements ShouldQueue
                 responseBody: Str::limit($exception->getMessage(), 2000, ''),
             );
 
-            $this->releaseForRetry();
+            $this->releaseForRetry($exception->getMessage());
         }
     }
 
@@ -179,14 +219,18 @@ class DeliverWebhook implements ShouldQueue
         return (int) round((hrtime(true) - $startedAt) / 1_000_000);
     }
 
-    private function releaseForRetry(): void
+    private function releaseForRetry(string $reason): void
     {
         $attempt = max($this->attempts() - 1, 0);
         $delay = $this->backoff()[$attempt] ?? last($this->backoff());
 
         if ($this->attempts() < $this->tries) {
             $this->release($delay);
+
+            return;
         }
+
+        throw new RuntimeException($reason);
     }
 
     /**
@@ -194,6 +238,6 @@ class DeliverWebhook implements ShouldQueue
      */
     public function failed(Throwable $exception): void
     {
-        //
+        report($exception);
     }
 }

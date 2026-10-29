@@ -58,7 +58,7 @@ class SesWebhookController extends Controller
             return response()->json(['message' => 'Invalid event payload.'], 422);
         }
 
-        $normalizer->record($source, $eventPayload);
+        $normalizer->record($source, $eventPayload, isset($payload['MessageId']) ? (string) $payload['MessageId'] : null);
         $log->forceFill(['status' => 'processed'])->save();
 
         return response()->json(['message' => 'Event processed.']);

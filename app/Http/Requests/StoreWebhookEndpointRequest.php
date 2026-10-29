@@ -2,6 +2,7 @@
 
 namespace App\Http\Requests;
 
+use App\Rules\PublicWebhookUrl;
 use Illuminate\Contracts\Validation\ValidationRule;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
@@ -24,7 +25,7 @@ class StoreWebhookEndpointRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'url' => ['required', 'url:http,https', 'max:2048'],
+            'url' => ['bail', 'required', 'url:http,https', 'max:2048', new PublicWebhookUrl],
             'events' => ['required', 'array', 'min:1'],
             'events.*' => ['string', Rule::in(['delivery', 'bounce', 'complaint', 'open', 'click', 'suppress', 'inbound.received'])],
             'status' => ['required', Rule::in(['active', 'paused'])],

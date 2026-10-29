@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\EmailNotSubmittedException;
 use App\Models\Source;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Http;
@@ -110,10 +111,15 @@ class SesV2Client
             $body['Destination'] = $destination;
         }
 
-        $payload = json_encode($body, JSON_THROW_ON_ERROR);
+        try {
+            $payload = json_encode($body, JSON_THROW_ON_ERROR);
+            $headers = $this->signedHeaders($source, 'POST', $target, $payload);
+        } catch (Throwable $exception) {
+            throw new EmailNotSubmittedException($exception->getMessage(), previous: $exception);
+        }
 
-        $headers = $this->signedHeaders($source, 'POST', $target, $payload);
         $response = Http::withHeaders($headers)
+            ->connectTimeout(5)
             ->timeout(15)
             ->withBody($payload, 'application/json')
             ->post($target);
