@@ -29,9 +29,13 @@ class EventPublisher
         });
     }
 
-    public function publish(EmailEvent $event, Email $email): EmailEvent
+    public function publish(EmailEvent $event, Email $email, ?string $origin = null): EmailEvent
     {
-        return DB::transaction(function () use ($event, $email): EmailEvent {
+        if ($origin !== null && ! in_array($origin, ['ses', 'internal'], true)) {
+            throw new LogicException('Email event origin is invalid.');
+        }
+
+        return DB::transaction(function () use ($event, $email, $origin): EmailEvent {
             $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
             $lockedEvent = EmailEvent::query()->whereKey($event->id)->lockForUpdate()->firstOrFail();
 
@@ -50,7 +54,7 @@ class EventPublisher
                     'contract_version' => 2,
                 ]);
                 $lockedEvent->setRelation('email', $lockedEmail);
-                $lockedEvent->public_event_data = $this->evidence->for($lockedEvent);
+                $lockedEvent->public_event_data = $this->evidence->for($lockedEvent, $origin);
                 $lockedEvent->save();
             }
 

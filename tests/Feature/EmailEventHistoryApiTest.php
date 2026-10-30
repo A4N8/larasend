@@ -46,12 +46,13 @@ it('returns bounded canonical event evidence and a separate mutable email snapsh
     });
 
     $response = $this->withToken($issued['plain_text'])->getJson("/api/emails/{$email->public_id}/events")
-        ->assertSuccessful()->assertJsonPath('data.0', $expected)
+        ->assertSuccessful()
         ->assertJsonPath('meta.email_snapshot.status', 'sent')->assertJsonPath('meta.pagination.has_more', false)
         ->assertJsonPath('meta.reconciliation.through_sequence', 1)->assertJsonPath('meta.reconciliation.completeness', 'stored_events_only')
         ->assertJsonPath('meta.reconciliation.retention_days', 731)->assertJsonPath('meta.reconciliation.automatic_deletion', false);
 
-    expect($response->getContent())->not->toContain('Private email body')
+    expect($response->json('data.0'))->toEqual($expected)
+        ->and($response->getContent())->not->toContain('Private email body')
         ->and(collect($queries)->filter(fn (string $sql): bool => preg_match('/select\s+\*\s+from\s+["`]?emails["`]?/i', $sql) === 1))->toBeEmpty();
     Queue::assertNothingPushed();
     Http::assertNothingSent();

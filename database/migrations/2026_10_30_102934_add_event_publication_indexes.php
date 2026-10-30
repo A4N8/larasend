@@ -50,7 +50,7 @@ return new class extends Migration
             ['email_events_email_id_email_sequence_unique', ['email_id', 'email_sequence'], true],
             ['email_events_submission_correlation_id_unique', ['submission_correlation_id'], true],
             ['email_events_email_id_id_index', ['email_id', 'id'], false],
-            ['email_events_source_id_ses_message_id_index', ['source_id', 'ses_message_id'], false],
+            ['email_events_source_id_ses_message_id_email_id_id_index', ['source_id', 'ses_message_id', 'email_id', 'id'], false],
         ];
 
         foreach ($indexes as [$name, $columns, $unique]) {

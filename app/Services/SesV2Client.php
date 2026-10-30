@@ -12,6 +12,8 @@ use Throwable;
 
 class SesV2Client
 {
+    public const CORRELATION_TAG = 'larasend_attempt_id';
+
     /**
      * @return array{mode: string, response: array<string, mixed>, tokens: array<int, string>}
      */
@@ -108,7 +110,7 @@ class SesV2Client
      * @param  array{ToAddresses?: array<int, string>, CcAddresses?: array<int, string>, BccAddresses?: array<int, string>}  $destination
      * @return array{message_id: string|null, response: array<string, mixed>}
      */
-    public function sendRawEmail(Source $source, string $mime, array $destination = []): array
+    public function sendRawEmail(Source $source, string $mime, array $destination = [], ?string $submissionCorrelationId = null): array
     {
         $target = "https://email.{$source->ses_region}.amazonaws.com/v2/email/outbound-emails";
         $body = [
@@ -122,6 +124,10 @@ class SesV2Client
 
         if ($destination !== []) {
             $body['Destination'] = $destination;
+        }
+
+        if ($submissionCorrelationId !== null) {
+            $body['EmailTags'] = [['Name' => self::CORRELATION_TAG, 'Value' => $submissionCorrelationId]];
         }
 
         try {

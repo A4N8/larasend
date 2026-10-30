@@ -9,13 +9,14 @@ use Throwable;
 class EventEvidence
 {
     /** @return array<string, mixed> */
-    public function for(EmailEvent $event): array
+    public function for(EmailEvent $event, ?string $origin = null): array
     {
         if ($event->public_event_data !== null) {
             return $event->public_event_data;
         }
 
         $legacy = $event->contract_version !== 2;
+        $isSes = $origin === 'ses' || ($origin === null && $event->provider_event_id !== null);
         $payload = $event->payload ?? [];
         $detail = $this->providerDetail($event->event_type, $payload);
         [$recipients, $attribution] = $this->recipients($event->event_type, $detail, $payload);
@@ -27,7 +28,7 @@ class EventEvidence
             $details['url_redacted'] = $url !== $event->url;
         }
 
-        if (! $legacy && $event->provider_event_id === null) {
+        if (! $legacy && ! $isSes) {
             foreach (['retryable', 'final'] as $key) {
                 if (is_bool($payload[$key] ?? null)) {
                     $details[$key] = $payload[$key];
@@ -45,10 +46,10 @@ class EventEvidence
             $recipient = count($recipients) === 1 ? $recipients[0] : null;
         }
 
-        $attemptId = $event->submission_correlation_id ?? ($payload['attempt_id'] ?? null);
+        $attemptId = $event->submission_correlation_id ?? ($payload['attempt_id'] ?? $payload['mail']['tags'][SesV2Client::CORRELATION_TAG][0] ?? null);
         $occurredAt = $event->occurred_at->toIso8601String();
 
-        if (! $legacy && $event->provider_event_id !== null) {
+        if (! $legacy && $isSes) {
             $timestamp = $detail['timestamp'] ?? $payload['mail']['timestamp'] ?? null;
 
             if (is_string($timestamp)) {
@@ -71,7 +72,7 @@ class EventEvidence
             'email_id' => $event->email?->public_id,
             'source_id' => $event->source_id,
             'sequence' => $event->email_sequence,
-            'origin' => $legacy ? 'legacy' : ($event->provider_event_id === null ? 'internal' : 'ses'),
+            'origin' => $legacy ? 'legacy' : ($isSes ? 'ses' : 'internal'),
             'attempt_id' => ! $legacy && is_string($attemptId) && preg_match('/\A[a-zA-Z0-9_-]{1,128}\z/', $attemptId) === 1 ? $attemptId : null,
             'recipient' => $recipient,
             'recipients' => $recipients,
@@ -110,6 +111,7 @@ class EventEvidence
             'bounce' => 'bouncedRecipients',
             'complaint' => 'complainedRecipients',
             'delivery' => 'recipients',
+            'suppress' => 'recipients',
             'delivery_delay', 'deliverydelay' => 'delayedRecipients',
             default => null,
         };
@@ -141,6 +143,10 @@ class EventEvidence
     private function details(array $detail): array
     {
         $details = [];
+
+        if (in_array($detail['transition'] ?? null, ['created', 'reactivated'], true)) {
+            $details['transition'] = $detail['transition'];
+        }
 
         foreach (['bounceType' => 'bounce_type', 'bounceSubType' => 'bounce_subtype',
             'complaintFeedbackType' => 'complaint_feedback_type', 'delayType' => 'delay_type',

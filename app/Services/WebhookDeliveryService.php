@@ -11,6 +11,8 @@ use Throwable;
 
 class WebhookDeliveryService
 {
+    public function __construct(private EventEvidence $evidence) {}
+
     public function dispatchFor(EmailEvent $event): void
     {
         $email = $event->email;
@@ -19,10 +21,12 @@ class WebhookDeliveryService
             return;
         }
 
+        $type = $this->evidence->for($event)['type'];
+
         $email->project
             ->webhookEndpoints()
             ->where('status', 'active')
-            ->whereJsonContains('events', $event->event_type)
+            ->whereJsonContains('events', $type)
             ->each(function ($endpoint) use ($event): void {
                 $this->dispatchJob(new DeliverWebhook($endpoint->id, $event->id));
             });

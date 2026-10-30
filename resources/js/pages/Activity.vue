@@ -468,6 +468,15 @@ const webhookEventOptions = [
     'click',
     'suppress',
     'inbound.received',
+    'submission_started',
+    'submission_accepted',
+    'submission_rejected',
+    'delivery_uncertain',
+    'failed',
+    'send',
+    'reject',
+    'delivery_delay',
+    'rendering_failure',
 ];
 const webhookForm = reactive({
     url: '',

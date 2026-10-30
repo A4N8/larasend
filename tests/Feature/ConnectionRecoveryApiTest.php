@@ -146,10 +146,39 @@ it('refuses to send through a different source with a bound key', function () {
     ])->assertNotFound();
 });
 
-it('returns a stable validation error code without changing the validation error shape', function () {
+it('returns a stable validation error code without changing the validation error shape', function (array $invalid, array $errors) {
     [, , $issued] = recoveryApiFixture();
-    $this->withToken($issued['plain_text'])->postJson('/api/emails', [])->assertUnprocessable()
-        ->assertJsonPath('error.code', 'validation_failed')->assertJsonValidationErrors(['from', 'to']);
+    Queue::fake();
+    Http::preventStrayRequests();
+
+    $this->withToken($issued['plain_text'])->postJson('/api/emails', $invalid)->assertUnprocessable()
+        ->assertJsonPath('error.code', 'validation_failed')->assertJsonValidationErrors($errors)
+        ->assertJsonStructure(['message', 'errors']);
+
+    expect(Email::query()->exists())->toBeFalse();
+    Queue::assertNothingPushed();
+    Http::assertNothingSent();
+})->with([
+    'missing required fields' => [[], ['from', 'to']],
+    'missing recipients' => [['from' => 'sender@example.com', 'subject' => 'Validation', 'text' => 'Body'], ['to']],
+    'invalid sender mailbox' => [['from' => 'not-an-email', 'to' => ['recipient@example.com'], 'subject' => 'Validation', 'text' => 'Body'], ['from']],
+    'invalid recipient mailbox' => [['from' => 'sender@example.com', 'to' => ['not-an-email'], 'subject' => 'Validation', 'text' => 'Body'], ['to.0']],
+]);
+
+it('preserves dashboard validation redirects and standard JSON errors', function () {
+    $user = User::factory()->create();
+    app(ProjectContext::class)->projectFor($user);
+    Queue::fake();
+    Http::preventStrayRequests();
+
+    $this->actingAs($user)->from('/activity')->post('/send', [])
+        ->assertRedirect('/activity')->assertSessionHasErrors(['from', 'to']);
+    $this->postJson('/send', [])->assertUnprocessable()
+        ->assertJsonValidationErrors(['from', 'to'])->assertJsonMissingPath('error.code');
+
+    expect(Email::query()->exists())->toBeFalse();
+    Queue::assertNothingPushed();
+    Http::assertNothingSent();
 });
 
 it('returns a stable idempotency conflict code without sending', function () {

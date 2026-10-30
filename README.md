@@ -117,7 +117,7 @@ Recommended setup:
 5. Subscribe the Larasend source webhook URL shown in the setup screen to that SNS topic and complete subscription confirmation. Keep this URL secret.
 6. Send a test email from Larasend and confirm delivery activity appears.
 
-Configuration-set event publishing is required for reliable recovery when the SES send response is lost: Larasend supplies a server-controlled correlation value in `EmailTags`, and event publishing returns it in `mail.tags`. Identity-level feedback notifications omit these message tags, so a notification without an already known SES message ID may remain unresolved. See the [SES event publishing setup](https://docs.aws.amazon.com/ses/latest/dg/monitor-using-event-publishing.html) and [SNS event format](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html).
+Configuration-set event publishing is required for reliable recovery when the SES send response is lost: Larasend supplies a server-controlled `larasend_attempt_id` correlation value in `EmailTags`, and event publishing returns it in `mail.tags`. Identity-level feedback notifications omit these message tags, so a notification without an already known SES message ID may remain unresolved. See the [SES event publishing setup](https://docs.aws.amazon.com/ses/latest/dg/monitor-using-event-publishing.html) and [SNS event format](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html).
 
 ## Cloudflare Email Service Setup
 
@@ -194,10 +194,15 @@ Each attachment includes `filename` and base64-encoded `content`, with an option
 
 ```json
 {
-  "html": "<img src=\"cid:logo@example.com\" alt=\"Company logo\">",
-  "attachments": [
-    { "filename": "logo.png", "content": "<base64 image bytes>", "content_type": "image/png", "content_id": "logo@example.com" }
-  ]
+    "html": "<img src=\"cid:logo@example.com\" alt=\"Company logo\">",
+    "attachments": [
+        {
+            "filename": "logo.png",
+            "content": "<base64 image bytes>",
+            "content_type": "image/png",
+            "content_id": "logo@example.com"
+        }
+    ]
 }
 ```
 
@@ -205,21 +210,21 @@ Content IDs use an ASCII address such as `logo@example.com`, without angle brack
 
 ### Connection Identity And Source Pinning
 
-Before sending, use the same bearer key to inspect `GET /api/connection?source_id=12`. `source_id` must be a positive integer. A source-bound key can omit it; an unbound key can use the resolved default for discovery, then explicitly pin the returned source on sends and recovery requests.
+Before sending, use the same bearer key to inspect `GET /api/connection?source_id=12`. This endpoint requires either `send` or `read:activity`. `source_id` must be a positive integer. A source-bound key can omit it; an unbound key can use the resolved default for discovery, then explicitly pin the returned source on sends and recovery requests. An unknown source, a source in another project, or a selection that conflicts with a source-bound key returns `404`.
 
 ```json
 {
-  "data": {
-    "object": "connection",
-    "contract_version": 2,
-    "instance_id": "6b29ff3b-bd99-4f27-b201-ef034db1368a",
-    "project_id": 3,
-    "api_key_id": 8,
-    "source_id": 12,
-    "source_pinned": true,
-    "capabilities": { "send": true, "read:activity": true },
-    "idempotency_scope": "api_key+source+client_key"
-  }
+    "data": {
+        "object": "connection",
+        "contract_version": 2,
+        "instance_id": "6b29ff3b-bd99-4f27-b201-ef034db1368a",
+        "project_id": 3,
+        "api_key_id": 8,
+        "source_id": 12,
+        "source_pinned": true,
+        "capabilities": { "send": true, "read:activity": true },
+        "idempotency_scope": "api_key+source+client_key"
+    }
 }
 ```
 
@@ -227,9 +232,9 @@ Before sending, use the same bearer key to inspect `GET /api/connection?source_i
 
 ### Idempotency And Read-Only Recovery
 
-Send an `Idempotency-Key` header on `POST /api/emails`. The client key must be valid UTF-8 and at most 255 bytes. Its scope is the authenticated API key identity, resolved source, and client key. Reusing that scope with an identical validated payload returns the original email and `replayed: true`; a different payload returns HTTP `409` with `error.code: "idempotency_conflict"`. Object key order does not change identity. Explicitly selecting the same resolved `source_id` does not change the payload fingerprint.
+Send a nonempty `Idempotency-Key` header on `POST /api/emails`. Leading and trailing whitespace is trimmed; the resulting client key must be valid UTF-8 and at most 255 bytes. Its scope is the authenticated API key identity, resolved source, and client key. Successful submission returns HTTP `202` with `id`, `object: "email"`, and `source_id`. Reusing that scope with an identical validated payload returns the same fields and `replayed: true`; a different payload returns HTTP `409` with `error.code: "idempotency_conflict"`. Object key order does not change identity; recipient array order and optional field values still matter. Explicitly selecting the same resolved `source_id` does not change the payload fingerprint.
 
-HTTP `422` distinguishes `error.code: "recipient_suppressed"` for synchronous suppression from `error.code: "validation_failed"` for invalid input. Existing human-readable `message` and validation `errors` remain available.
+`POST /api/emails` returns HTTP `422` with `error.code: "recipient_suppressed"` for synchronous suppression or `error.code: "validation_failed"` for invalid input. Existing human-readable `message` and validation `errors` remain available.
 
 An idempotent POST replay may dispatch an email that is still queued. After a lost HTTP response, recover through a GET instead:
 
@@ -239,19 +244,19 @@ curl 'https://mail.example.com/api/emails/lookup?source_id=12' \
   -H 'Idempotency-Key: invoice-2026-0042'
 ```
 
-Lookup requires `read:activity` and an exact match for the same API key identity, source, and client key. `source_id` is required for unbound keys; a source-bound key can infer its own source. A successful HTTP `200` response contains a bounded email summary and no message body:
+Lookup requires `read:activity` and an exact match for the same API key identity, source, and client key. `source_id` is required for unbound keys; a source-bound key can infer its own source. A missing, blank, oversized, or invalid UTF-8 client key returns `422`. A successful HTTP `200` response contains a bounded email summary and no message body:
 
 ```json
 {
-  "data": {
-    "id": "em_example",
-    "object": "email",
-    "status": "queued",
-    "source_id": 12,
-    "created_at": "2026-10-30T10:00:00+00:00",
-    "sent_at": null
-  },
-  "meta": { "matched_by": "idempotency_key", "read_only": true }
+    "data": {
+        "id": "em_example",
+        "object": "email",
+        "status": "queued",
+        "source_id": 12,
+        "created_at": "2026-10-30T10:00:00+00:00",
+        "sent_at": null
+    },
+    "meta": { "matched_by": "idempotency_key", "read_only": true }
 }
 ```
 
@@ -265,25 +270,27 @@ Credential rotation creates a different API key identity. Changing the default s
 
 `data` is an array of the same canonical event objects delivered as webhook `data.event`. Each object has:
 
-| Field | Meaning |
-| --- | --- |
-| `id` | Stable `evt_` event ID, shared with webhook IDs. Scope deduplication by installation identity plus event ID. |
-| `object`, `contract_version` | `email_event` and the evidence contract version. |
-| `type` | Exact subscription wire name listed below. |
-| `occurred_at`, `created_at` | ISO 8601 occurrence time; `created_at` is its compatibility alias. Provider timestamps describe the provider occurrence; internal timestamps describe the recorded submission transition. |
-| `recorded_at` | When Larasend stored the event, which can be later than occurrence time. |
-| `email_id`, `source_id` | Email public ID and integer source ID. |
-| `sequence` | Per-email publication sequence for version 2; `null` for legacy evidence. |
-| `origin`, `attempt_id` | `internal`, `ses`, or `legacy`; internal submission attempt identifier when available, otherwise `null`. |
-| `recipient`, `recipients` | A single attributed recipient when available, otherwise `null`; the available recipient list, possibly empty. |
-| `url`, `user_agent`, `ip_address` | Available engagement evidence, otherwise `null`. URLs are restricted to their origin. |
-| `details`, `payload` | Allowlisted structured evidence; `payload` is a compatibility alias of `details`, not a raw provider payload. |
+| Field                             | Meaning                                                                                                                                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                              | Stable `evt_` event ID, shared with webhook IDs. Scope deduplication by installation identity plus event ID.                                                                              |
+| `object`, `contract_version`      | `email_event` and the evidence contract version.                                                                                                                                          |
+| `type`                            | Exact subscription wire name listed below.                                                                                                                                                |
+| `occurred_at`, `created_at`       | ISO 8601 occurrence time; `created_at` is its compatibility alias. Provider timestamps describe the provider occurrence; internal timestamps describe the recorded submission transition. |
+| `recorded_at`                     | When Larasend stored the event, which can be later than occurrence time.                                                                                                                  |
+| `email_id`, `source_id`           | Email public ID and integer source ID.                                                                                                                                                    |
+| `sequence`                        | Per-email publication sequence for version 2; `null` for legacy evidence.                                                                                                                 |
+| `origin`, `attempt_id`            | `internal`, `ses`, or `legacy`; internal submission attempt identifier when available, otherwise `null`.                                                                                  |
+| `recipient`, `recipients`         | A single attributed recipient when available, otherwise `null`; the available recipient list, possibly empty.                                                                             |
+| `url`, `user_agent`, `ip_address` | Available engagement evidence, otherwise `null`. URLs are restricted to their origin.                                                                                                     |
+| `details`, `payload`              | Allowlisted structured evidence; `payload` is a compatibility alias of `details`, not a raw provider payload.                                                                             |
 
 Version 2 event IDs always identify the same occurrence, type, timestamps, and details, including across webhook retries. `meta.email_snapshot` carries the current mutable email `id`, `status`, and `source_id`; status is not immutable event evidence.
 
+For SES events, `occurred_at` prefers the event detail's `timestamp`, then `mail.timestamp`, then the stored ingestion time when neither is available. Rendering Failure normally has no timestamp in `failure`, so its occurrence time usually reflects `mail.timestamp`, not the exact rendering failure time. Timestamp precision can vary with the available evidence.
+
 The response includes `meta.pagination` with `limit`, `has_more`, and `next_cursor`, and `meta.reconciliation` with `checkpoint`, `through_sequence`, `legacy_baseline_complete`, `completeness`, `retention_days`, `automatic_deletion`, and `limitations`.
 
-Follow `next_cursor` while `has_more` is true. Only after finishing the page chain, persist its terminal `checkpoint`. Pass that checkpoint as `cursor` on the next poll. Cursors are opaque and scoped to one email; do not derive them from event IDs or timestamps. Publication sequences follow committed availability, so an old provider occurrence received late, or an orphan event linked later, appears after an earlier checkpoint. Timestamp order and numeric event ID order are not reconciliation watermarks.
+Follow `next_cursor` while `has_more` is true. Only after finishing the page chain, persist its terminal `checkpoint`; terminal pages include a checkpoint even when `data` is empty. Pass that checkpoint as `cursor` on the next poll. Cursors are opaque and scoped to the installation, project, API key, source, and email; do not derive them from event IDs or timestamps. Publication sequences follow committed availability, so an old provider occurrence received late, or an orphan event linked later, appears after an earlier checkpoint. Timestamp order and numeric event ID order are not reconciliation watermarks.
 
 Legacy rows retain their existing event IDs and wire types, with `contract_version: 1` and `sequence: null`. Cursor traversal includes a legacy baseline before advancing through version 2 publications; `legacy_baseline_complete` reports whether it has been traversed. Earlier lifecycle rows overwritten by old behavior cannot be reconstructed, and no historical transitions are fabricated.
 
@@ -293,20 +300,24 @@ Legacy rows retain their existing event IDs and wire types, with `contract_versi
 
 Subscribe to exact wire names on an active webhook endpoint in the same project:
 
-| Origin | Wire names | Interpretation |
-| --- | --- | --- |
-| Internal submission | `submission_started`, `submission_accepted`, `submission_rejected` | An attempt started, the provider accepted submission, or submission was rejected. A rejection's details identify retryability; rejection alone does not mean final failure. |
-| Internal terminal outcome | `delivery_uncertain`, `failed` | Submission may have reached the provider without a conclusive response, or the send reached final failure. Uncertainty does not authorize resending. |
-| SES | `send`, `delivery`, `bounce`, `complaint`, `open`, `click`, `reject`, `delivery_delay`, `rendering_failure` | Provider event evidence. `send` means an SES Send event, distinct from internal `submission_accepted`. A delay is not final failure. |
-| Later suppression | `suppress` | An observed suppression associated with an existing email. |
+| Origin              | Wire names                                                                                                  | Interpretation                                                                                                                                                              |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Internal submission | `submission_started`, `submission_accepted`, `submission_rejected`                                          | An attempt started, the provider accepted submission, or submission was rejected. A rejection's details identify retryability; rejection alone does not mean final failure. |
+| Internal outcome    | `delivery_uncertain`, `failed`                                                                              | Submission may have reached the provider without a conclusive response, or the send reached final failure. Uncertainty does not authorize resending.                        |
+| SES                 | `send`, `delivery`, `bounce`, `complaint`, `open`, `click`, `reject`, `delivery_delay`, `rendering_failure` | Provider event evidence. `send` means an SES Send event, distinct from internal `submission_accepted`. A delay is not final failure.                                        |
+| Later suppression   | `suppress`                                                                                                  | An observed suppression associated with an existing email.                                                                                                                  |
 
-Existing `delivery`, `bounce`, `complaint`, `open`, `click`, `suppress`, and `inbound.received` subscriptions remain valid. Inbound webhooks retain their separate inbound envelope. A synchronously suppressed recipient causes HTTP `422` before an email is created: there is no fabricated email or outbound `suppress` event for that rejected request. A later provider suppression can produce associated suppression evidence; a suppression-list entry without a verifiable email association cannot establish that a particular email was sent.
+Existing `delivery`, `bounce`, `complaint`, `open`, `click`, `suppress`, and `inbound.received` subscriptions remain valid. Inbound webhooks retain their separate inbound envelope. A synchronously suppressed recipient causes HTTP `422` before an email is created: there is no fabricated email or outbound `suppress` event for that rejected request. A later provider suppression can produce associated suppression evidence when an entry is created or reactivated; updating an already active entry does not emit another `suppress` transition. A suppression-list entry without a verifiable email association cannot establish that a particular email was sent.
 
-SES DeliveryDelay is read from `deliveryDelay`, including its timestamp, delayed recipients, expiration, and available diagnostic evidence. Rendering Failure is read from `failure`. Structured failure and delay details retain useful classifications and status codes while omitting raw headers, credentials, message contents, and sensitive diagnostic text. Click URLs expose only scheme, host, and port; path, query, fragment, and user information are removed, with `details.url_redacted` indicating redaction. Consumers cannot recover action-link tokens or exact clicked paths from this API.
+SES DeliveryDelay is read from `deliveryDelay`, including its timestamp, delayed recipients, expiration, and available diagnostic evidence. Rendering Failure is read from `failure`. Depending on the event, `details` can include `bounce_type`, `bounce_subtype`, `complaint_feedback_type`, `delay_type`, `expiration_time`, `reporting_mta`, `smtp_response`, `error_message`, `template_name`, `reason`, `feedback_id`, and `processing_time_ms`. Per-recipient `details.recipients` entries can contain `email`, `action`, `status`, and `diagnostic_code`. Internal outcomes expose `retryable`, `final`, and a machine-readable `code` when available; suppression transitions can expose `transition: "created"` or `"reactivated"`.
 
-Recipient evidence is limited to what the provider reports. An event can name multiple recipients or omit them; `recipient` must not be treated as proof of a unique affected recipient when `recipients` contains multiple values. SES complaints can describe possible complainants rather than a uniquely identified person. Open/click signals do not establish that every original recipient engaged, and missing attribution is not filled by guessing.
+Only known diagnostic fields are exported; raw provider headers and message contents are excluded, and embedded HTTP(S) URLs are redacted to their origin. Click URLs likewise expose only scheme, host, and port; path, query, fragment, and user information are removed, with `details.url_redacted` indicating redaction. Exact clicked paths and action-link tokens in those URLs are unavailable through event evidence.
+
+Recipient evidence is limited to what the provider reports. `details.recipient_attribution` is `recipient` for an event-specific recipient list, `message` for the message destination list, or `unknown` when no usable addresses are available. An event can name multiple recipients or omit them; `recipient` must not be treated as proof of a unique affected recipient when `recipients` contains multiple values. SES complaints can describe possible complainants rather than a uniquely identified person. Open/click signals do not establish that every original recipient engaged, and missing attribution is not filled by guessing.
 
 Larasend passes server-controlled correlation tags during SES submission and checks source ownership before linking later events. Early events and later orphan reconciliation use the same identity checks and deduplication. A tag alone cannot attach an event from another source, and historical events without an exact verifiable match stay unresolved. Recovery never resubmits mail to discover its outcome.
+
+Associating a larger set of retained provider events can continue in a queued background job. This work stores verified event associations and publishes evidence; it never sends or resends email. Lookup and history GET requests never enqueue this work.
 
 ### Outbound Webhooks And Signatures
 

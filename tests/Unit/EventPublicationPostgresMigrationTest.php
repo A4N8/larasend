@@ -31,7 +31,7 @@ it('restores PostgreSQL lock timeouts and repairs invalid event publication inde
     DB::statement("SET statement_timeout = '10000ms'");
     DB::statement("SET lock_timeout = '1379ms'");
     $migration = require database_path('migrations/2026_10_30_102934_add_event_publication_indexes.php');
-    $validIndexes = fn (): array => DB::select("SELECT c.relname, i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('email_events_email_id_email_sequence_unique', 'email_events_submission_correlation_id_unique', 'email_events_email_id_id_index', 'email_events_source_id_ses_message_id_index') AND n.nspname = current_schema() ORDER BY c.relname");
+    $validIndexes = fn (): array => DB::select("SELECT c.relname, i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('email_events_email_id_email_sequence_unique', 'email_events_submission_correlation_id_unique', 'email_events_email_id_id_index', 'email_events_source_id_ses_message_id_email_id_id_index') AND n.nspname = current_schema() ORDER BY c.relname");
     $user = User::factory()->create();
     $workspace = Workspace::create(['owner_id' => $user->id, 'name' => 'Publication migration', 'slug' => fake()->uuid()]);
     $project = Project::create(['workspace_id' => $workspace->id, 'name' => 'Publication migration', 'slug' => fake()->uuid()]);

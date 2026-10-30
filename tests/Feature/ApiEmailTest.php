@@ -140,7 +140,7 @@ it('stores outbound mime on the configured default disk', function () {
 
     $this->app->bind(SesV2Client::class, fn () => new class extends SesV2Client
     {
-        public function sendRawEmail(Source $source, string $mime, array $destination = []): array
+        public function sendRawEmail(Source $source, string $mime, array $destination = [], ?string $submissionCorrelationId = null): array
         {
             expect($mime)->toContain('Durable storage');
 
@@ -626,7 +626,7 @@ it('sends queued email jobs through ses and records the response', function () {
 
     $this->app->bind(SesV2Client::class, fn () => new class extends SesV2Client
     {
-        public function sendRawEmail(Source $source, string $mime, array $destination = []): array
+        public function sendRawEmail(Source $source, string $mime, array $destination = [], ?string $submissionCorrelationId = null): array
         {
             expect($mime)->toContain('Welcome to Larasend');
 
@@ -642,7 +642,9 @@ it('sends queued email jobs through ses and records the response', function () {
         ->source_id->toBe($source->id)
         ->status->toBe('sent')
         ->ses_message_id->toBe('ses-message-1')
-        ->and($email->events()->where('event_type', 'send')->exists())->toBeTrue();
+        ->and($email->events()->where('event_type', 'submission_started')->exists())->toBeTrue()
+        ->and($email->events()->where('event_type', 'submission_accepted')->exists())->toBeTrue()
+        ->and($email->events()->where('event_type', 'send')->exists())->toBeFalse();
 });
 
 it('sends bcc recipients through an explicit ses destination', function () {
