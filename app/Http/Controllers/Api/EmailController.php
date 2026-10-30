@@ -2,17 +2,19 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Exceptions\RecipientsSuppressedException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\SendEmailRequest;
 use App\Jobs\SendQueuedEmail;
 use App\Models\ApiKey;
 use App\Models\Email;
 use App\Models\Project;
-use App\Models\Source;
+use App\Services\ApiSourceResolver;
 use App\Services\EmailSendService;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 
 class EmailController extends Controller
 {
@@ -20,8 +22,11 @@ class EmailController extends Controller
     {
         /** @var Project $project */
         $project = $request->attributes->get('larasend_project');
+        /** @var ApiKey $key */
+        $key = $request->attributes->get('larasend_api_key');
 
         $emails = $project->emails()
+            ->when($key->source_id !== null, fn ($query) => $query->where('source_id', $key->source_id))
             ->with(['recipients', 'events'])
             ->latest()
             ->when($request->string('status')->isNotEmpty(), fn ($query) => $query->where('status', $request->string('status')))
@@ -38,22 +43,22 @@ class EmailController extends Controller
         ]);
     }
 
-    public function store(SendEmailRequest $request, EmailSendService $emailSendService): JsonResponse
+    public function store(SendEmailRequest $request, EmailSendService $emailSendService, ApiSourceResolver $sources): JsonResponse
     {
         /** @var Project $project */
         $project = $request->attributes->get('larasend_project');
-        /** @var Source|null $source */
-        $source = $request->attributes->get('larasend_source');
+        $source = $sources->resolve($request);
 
         $payload = $request->validated();
+        unset($payload['source_id']);
         $clientKey = trim((string) $request->header('Idempotency-Key', ''));
 
         if (strlen($clientKey) > 255) {
-            return response()->json(['message' => 'The Idempotency-Key header may not exceed 255 bytes.'], 422);
+            return response()->json(['message' => 'The Idempotency-Key header may not exceed 255 bytes.', 'error' => ['code' => 'validation_failed']], 422);
         }
 
         if (preg_match('//u', $clientKey) !== 1) {
-            return response()->json(['message' => 'The Idempotency-Key header must contain valid UTF-8.'], 422);
+            return response()->json(['message' => 'The Idempotency-Key header must contain valid UTF-8.', 'error' => ['code' => 'validation_failed']], 422);
         }
 
         $idempotencyKey = null;
@@ -62,7 +67,6 @@ class EmailController extends Controller
         if ($clientKey !== '') {
             /** @var ApiKey $apiKey */
             $apiKey = $request->attributes->get('larasend_api_key');
-            $source ??= $project->sources()->where('environment', $project->default_environment)->firstOrFail();
             $idempotencyKey = hash('sha256', json_encode([$apiKey->id, $source->id, $clientKey], JSON_THROW_ON_ERROR));
             $idempotencyHash = hash('sha256', json_encode($this->canonicalPayload($payload), JSON_THROW_ON_ERROR));
             $existing = $project->emails()->where('idempotency_key', $idempotencyKey)->first();
@@ -82,25 +86,35 @@ class EmailController extends Controller
             }
 
             return $this->replay($existing, $idempotencyHash);
+        } catch (RecipientsSuppressedException $exception) {
+            return $this->validationFailure($exception, 'recipient_suppressed');
+        } catch (ValidationException $exception) {
+            return $this->validationFailure($exception, 'validation_failed');
         }
 
         return response()->json([
             'id' => $email->public_id,
             'object' => 'email',
+            'source_id' => $email->source_id,
         ], 202);
     }
 
     private function replay(Email $email, string $idempotencyHash): JsonResponse
     {
         if (! hash_equals((string) $email->idempotency_hash, $idempotencyHash)) {
-            return response()->json(['message' => 'This Idempotency-Key was already used with a different request.'], 409);
+            return response()->json(['message' => 'This Idempotency-Key was already used with a different request.', 'error' => ['code' => 'idempotency_conflict']], 409);
         }
 
         if ($email->status === 'queued') {
             SendQueuedEmail::dispatchAfterCommit($email->id, reportFailure: true);
         }
 
-        return response()->json(['id' => $email->public_id, 'object' => 'email', 'replayed' => true], 202);
+        return response()->json(['id' => $email->public_id, 'object' => 'email', 'source_id' => $email->source_id, 'replayed' => true], 202);
+    }
+
+    private function validationFailure(ValidationException $exception, string $code): JsonResponse
+    {
+        return response()->json(['message' => $exception->getMessage(), 'errors' => $exception->errors(), 'error' => ['code' => $code]], 422);
     }
 
     /**
@@ -126,8 +140,11 @@ class EmailController extends Controller
     {
         /** @var Project $project */
         $project = $request->attributes->get('larasend_project');
+        /** @var ApiKey $key */
+        $key = $request->attributes->get('larasend_api_key');
 
         $model = $project->emails()
+            ->when($key->source_id !== null, fn ($query) => $query->where('source_id', $key->source_id))
             ->with(['recipients', 'events', 'attachments', 'source', 'template'])
             ->where('public_id', $email)
             ->firstOrFail();

@@ -3,7 +3,10 @@
 namespace App\Http\Requests;
 
 use Illuminate\Contracts\Validation\ValidationRule;
+use Illuminate\Contracts\Validation\Validator as ValidatorContract;
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Http\Exceptions\HttpResponseException;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Validation\Validator;
 
 class SendEmailRequest extends FormRequest
@@ -24,6 +27,7 @@ class SendEmailRequest extends FormRequest
     public function rules(): array
     {
         return [
+            'source_id' => ['sometimes', 'integer', 'min:1'],
             'from' => ['required', 'string', 'max:255'],
             'to' => ['required', 'array', 'min:1', 'max:1000'],
             'to.*' => ['required', 'string', 'max:255'],
@@ -47,6 +51,21 @@ class SendEmailRequest extends FormRequest
             'tags' => ['sometimes', 'array'],
             'tags.*' => ['string', 'max:255'],
         ];
+    }
+
+    protected function failedValidation(ValidatorContract $validator): void
+    {
+        if ($this->routeIs('api.emails.store') && $this->expectsJson()) {
+            $exception = new ValidationException($validator);
+
+            throw new HttpResponseException(response()->json([
+                'message' => $exception->getMessage(),
+                'errors' => $exception->errors(),
+                'error' => ['code' => 'validation_failed'],
+            ], 422));
+        }
+
+        parent::failedValidation($validator);
     }
 
     /**

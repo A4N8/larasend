@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Events\EmailActivityUpdated;
+use App\Exceptions\RecipientsSuppressedException;
 use App\Jobs\SendQueuedEmail;
 use App\Models\Email;
 use App\Models\Project;
@@ -256,8 +257,8 @@ class EmailSendService
             return;
         }
 
-        throw ValidationException::withMessages([
-            'to' => 'This email includes suppressed recipients: '.implode(', ', $suppressed),
+        throw RecipientsSuppressedException::withMessages([
+            'to' => 'One or more recipients are suppressed.',
         ]);
     }
 

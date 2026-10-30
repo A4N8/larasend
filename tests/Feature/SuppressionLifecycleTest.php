@@ -45,7 +45,7 @@ it('retains expired suppressions but blocks only active canonical matches across
     DB::table('suppressions')->where('id', $blocker->id)->update(['email' => ' BLOCK@Example.NET ']);
     $payload = ['from' => 'sender@example.com', 'to' => ['other@example.net'], 'subject' => 'Testing', 'text' => 'Testing', $field => ['Block@example.net']];
 
-    expect(fn () => app(EmailSendService::class)->send($project, $source, $payload))->toThrow(ValidationException::class, 'suppressed recipients');
+    expect(fn () => app(EmailSendService::class)->send($project, $source, $payload))->toThrow(ValidationException::class, 'One or more recipients are suppressed.');
     $blocker->forceFill(['expires_at' => now()])->save();
     app(EmailSendService::class)->send($project, $source, $payload);
 

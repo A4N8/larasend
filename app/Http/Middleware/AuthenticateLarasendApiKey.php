@@ -34,19 +34,22 @@ class AuthenticateLarasendApiKey
             return response()->json(['message' => 'Invalid Larasend API key.'], 401);
         }
 
-        $requiredScope = match ($request->route()?->getName()) {
-            'api.emails.index', 'api.emails.show' => 'read:activity',
-            'api.emails.store' => 'send',
-            'api.suppressions.destroy' => 'manage:suppressions',
+        $requiredScopes = match ($request->route()?->getName()) {
+            'api.connection.show' => ['send', 'read:activity'],
+            'api.emails.index', 'api.emails.show', 'api.emails.lookup', 'api.emails.events.index' => ['read:activity'],
+            'api.emails.store' => ['send'],
+            'api.suppressions.destroy' => ['manage:suppressions'],
             default => null,
         };
 
-        if ($requiredScope === null) {
+        if ($requiredScopes === null) {
             return response()->json(['message' => 'This API route has no configured Larasend API key scope.'], 403);
         }
 
-        if (! $apiKey->allows($requiredScope)) {
-            return response()->json(['message' => "This Larasend API key is missing the {$requiredScope} scope."], 403);
+        if (! collect($requiredScopes)->contains(fn (string $scope): bool => $apiKey->allows($scope))) {
+            $label = implode(' or ', $requiredScopes);
+
+            return response()->json(['message' => "This Larasend API key is missing the {$label} scope."], 403);
         }
 
         $apiKey->forceFill([
