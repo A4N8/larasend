@@ -62,10 +62,10 @@ class SesEventNormalizer
             'payload' => $payload,
             'occurred_at' => $this->occurredAt($message, $detail),
         ]);
-        $event = $this->associate($source, $event);
+        $event = $this->associate($source, $event, true);
 
         if ($event->email_id === null) {
-            DB::afterCommit(fn () => $this->associate($source, $event));
+            DB::afterCommit(fn () => $this->associate($source, $event, true));
         }
 
         if ($event->email_id !== null) {
@@ -110,9 +110,9 @@ class SesEventNormalizer
         }
     }
 
-    private function associate(Source $source, EmailEvent $event): EmailEvent
+    private function associate(Source $source, EmailEvent $event, bool $scheduleBindingRecovery = false): EmailEvent
     {
-        return DB::transaction(function () use ($source, $event): EmailEvent {
+        return DB::transaction(function () use ($source, $event, $scheduleBindingRecovery): EmailEvent {
             $email = $this->resolveEmail($source, $event);
 
             if ($email === null) {
@@ -130,8 +130,9 @@ class SesEventNormalizer
             }
 
             $newAssociation = $event->email_id === null;
+            $newBinding = $lockedEmail->ses_message_id === null;
 
-            if ($lockedEmail->ses_message_id === null) {
+            if ($newBinding) {
                 $lockedEmail->update(['ses_message_id' => $event->ses_message_id]);
             }
 
@@ -141,8 +142,29 @@ class SesEventNormalizer
                 $this->applyEvent($lockedEmail, $event);
             }
 
+            if ($scheduleBindingRecovery && ($newBinding || (! $newAssociation && isset($event->payload['mail']['tags'][SesV2Client::CORRELATION_TAG])))) {
+                DB::afterCommit(fn () => $this->recoverBindingOrphans($source, $event));
+            }
+
             return $event;
         });
+    }
+
+    private function recoverBindingOrphans(Source $source, EmailEvent $event): void
+    {
+        $email = $this->resolveEmail($source, $event);
+
+        if ($email === null || $event->email_id !== $email->id) {
+            return;
+        }
+
+        $throughEventId = EmailEvent::query()->where('source_id', $source->id)
+            ->where('ses_message_id', $event->ses_message_id)->whereNull('email_id')
+            ->whereIn('event_type', self::PROVIDER_EVENT_TYPES)->max('id');
+
+        if ($throughEventId !== null) {
+            (new ReconcileSesEvents($email->id, $source->id, $event->ses_message_id, 0, $throughEventId))->dispatchAfterCommit();
+        }
     }
 
     private function resolveEmail(Source $source, EmailEvent $event): ?Email

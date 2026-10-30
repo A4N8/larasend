@@ -410,3 +410,70 @@ it('never reclassifies or resends accepted mail when a reconciliation continuati
         ->and($email->events()->orderBy('email_sequence')->pluck('event_type')->all())->toBe(['submission_started', 'submission_accepted']);
     Http::assertSentCount(1);
 });
+
+it('recovers an earlier untagged orphan after a late tagged binding following an uncertain submission', function (): void {
+    [$source, $email] = immutableSubmissionFixture();
+    $requests = 0;
+    Http::fake(function () use (&$requests): never {
+        $requests++;
+        throw new ConnectionException('Submission response lost');
+    });
+    expect(fn () => (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class)))->toThrow(ConnectionException::class);
+    $normalizer = app(SesEventNormalizer::class);
+    $payload = immutableSesPayload('Click', 'ses-late-bind');
+    $payload['click'] = ['timestamp' => '2026-10-30T10:05:00.654321Z', 'link' => 'https://example.net/private?token=secret'];
+    $earlier = $normalizer->record($source, $payload, 'sns-earlier-untagged');
+    expect($earlier->email_id)->toBeNull()->and($email->fresh()->status)->toBe('sending');
+    $attempt = $email->events()->where('event_type', 'submission_started')->sole()->submission_correlation_id;
+    $binding = $normalizer->record($source, immutableSesPayload('Send', 'ses-late-bind', $attempt), 'sns-late-binding');
+    Queue::assertPushed(ReconcileSesEvents::class, 1);
+    $job = Queue::pushed(ReconcileSesEvents::class)->first();
+    expect($job->afterEventId)->toBe(0)->and($job->throughEventId)->toBe($earlier->id);
+    $this->mock(EmailProviderFactory::class)->shouldNotReceive('forSource');
+    $job->handle($normalizer);
+    $job->handle($normalizer);
+
+    expect($earlier->fresh()->email_id)->toBe($email->id)->and($earlier->fresh()->id)->toBe($earlier->id)
+        ->and($earlier->fresh()->email_sequence)->toBeGreaterThan($binding->email_sequence)
+        ->and($email->fresh()->status)->toBe('clicked')->and($requests)->toBe(1);
+    Queue::assertPushed(ReconcileSesEvents::class, 1);
+});
+
+it('retries a late binding recovery enqueue through the same verified SNS occurrence without resending', function (): void {
+    [$source, $email] = immutableSubmissionFixture();
+    $requests = 0;
+    Http::fake(function () use (&$requests): never {
+        $requests++;
+        throw new ConnectionException('Submission response lost');
+    });
+    expect(fn () => (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class)))->toThrow(ConnectionException::class);
+    $normalizer = app(SesEventNormalizer::class);
+    $payload = immutableSesPayload('Click', 'ses-binding-outage');
+    $payload['click'] = ['timestamp' => '2026-10-30T10:06:00Z'];
+    $orphan = $normalizer->record($source, $payload, 'sns-outage-untagged');
+    $attempt = $email->events()->where('event_type', 'submission_started')->sole()->submission_correlation_id;
+    $bindingPayload = immutableSesPayload('Send', 'ses-binding-outage', $attempt);
+    $realDispatcher = app(Dispatcher::class);
+    $unavailable = true;
+    $dispatcher = $this->mock(Dispatcher::class);
+    $dispatcher->shouldReceive('dispatch')->andReturnUsing(function ($job) use ($realDispatcher, &$unavailable) {
+        if ($job instanceof ReconcileSesEvents && $unavailable) {
+            $unavailable = false;
+            throw new RuntimeException('Binding recovery broker unavailable');
+        }
+
+        return $realDispatcher->dispatch($job);
+    });
+    expect(fn () => $normalizer->record($source, $bindingPayload, 'sns-binding-outage'))
+        ->toThrow(RuntimeException::class, 'Binding recovery broker unavailable');
+    $bound = $email->events()->where('event_type', 'send')->sole();
+    expect($email->fresh()->ses_message_id)->toBe('ses-binding-outage')->and($email->fresh()->status)->toBe('sent');
+    $replay = $normalizer->record($source, $bindingPayload, 'sns-binding-outage');
+    Queue::assertPushed(ReconcileSesEvents::class, 1);
+    $this->mock(EmailProviderFactory::class)->shouldNotReceive('forSource');
+    Queue::pushed(ReconcileSesEvents::class)->first()->handle($normalizer);
+
+    expect($replay->id)->toBe($bound->id)->and($orphan->fresh()->email_id)->toBe($email->id)
+        ->and($email->fresh()->status)->toBe('clicked')->and($requests)->toBe(1)
+        ->and($email->events()->where('event_type', 'submission_started')->count())->toBe(1);
+});

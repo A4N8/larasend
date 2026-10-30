@@ -167,6 +167,7 @@ Create an API key in Larasend, then send:
 ```bash
 curl -X POST https://mail.example.com/api/emails \
   -H "Authorization: Bearer ls_your_api_key" \
+  -H "Accept: application/json" \
   -H "Content-Type: application/json" \
   -d '{
     "from": "Acme <notifications@mail.example.com>",
@@ -241,6 +242,7 @@ An idempotent POST replay may dispatch an email that is still queued. After a lo
 ```bash
 curl 'https://mail.example.com/api/emails/lookup?source_id=12' \
   -H 'Authorization: Bearer ls_your_api_key' \
+  -H 'Accept: application/json' \
   -H 'Idempotency-Key: invoice-2026-0042'
 ```
 
