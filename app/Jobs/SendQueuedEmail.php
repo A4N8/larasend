@@ -6,6 +6,7 @@ use App\Events\EmailActivityUpdated;
 use App\Exceptions\EmailNotSubmittedException;
 use App\Models\Email;
 use App\Models\EmailEvent;
+use App\Services\EventPublisher;
 use App\Services\Providers\EmailProviderFactory;
 use App\Services\SesEventNormalizer;
 use Illuminate\Bus\UniqueLock;
@@ -18,6 +19,7 @@ use Illuminate\Queue\SyncQueue;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use RuntimeException;
 use Throwable;
 
@@ -120,14 +122,18 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
         $envelope = $this->envelope($email);
 
         $submission = DB::transaction(function () use ($email): ?EmailEvent {
-            if (Email::query()->whereKey($email->id)->where('status', 'queued')->update(['status' => 'sending']) !== 1) {
+            $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
+
+            if ($lockedEmail->status !== 'queued') {
                 return null;
             }
 
-            return $email->events()->create([
-                'source_id' => $email->source_id,
+            $lockedEmail->update(['status' => 'sending']);
+
+            return app(EventPublisher::class)->record($lockedEmail, [
                 'event_type' => 'submission_started',
-                'payload' => ['message' => 'Submission is in progress. If sending persists after the worker stops, check provider delivery records before retrying manually.'],
+                'submission_correlation_id' => Str::random(48),
+                'payload' => ['code' => 'submission_started'],
                 'occurred_at' => now(),
             ]);
         });
@@ -136,25 +142,29 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        $envelope['submission_correlation_id'] = $submission->submission_correlation_id;
+
         try {
             $result = $provider->sendRawEmail($email->source, $mime, $envelope);
         } catch (Throwable $exception) {
             $definitelyNotSubmitted = $exception instanceof EmailNotSubmittedException
                 || ($exception instanceof RequestException && $exception->response->clientError());
 
-            if ($definitelyNotSubmitted) {
-                Email::query()->whereKey($email->id)->where('status', 'sending')->update(['status' => 'queued']);
-            }
+            DB::transaction(function () use ($email, $submission, $exception, $definitelyNotSubmitted): void {
+                $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
 
-            $submission->forceFill([
-                'event_type' => $definitelyNotSubmitted ? 'submission_rejected' : 'delivery_uncertain',
-                'payload' => [
-                    'error' => $exception->getMessage(),
-                    'message' => $definitelyNotSubmitted
-                        ? 'No message was accepted by the provider. This email can be retried safely.'
-                        : 'The provider may have accepted this email. Check provider delivery records before retrying manually.',
-                ],
-            ])->save();
+                if ($definitelyNotSubmitted && $lockedEmail->status === 'sending') {
+                    $lockedEmail->update(['status' => 'queued']);
+                }
+
+                app(EventPublisher::class)->record($lockedEmail, [
+                    'event_type' => $definitelyNotSubmitted ? 'submission_rejected' : 'delivery_uncertain',
+                    'payload' => ['attempt_id' => $submission->submission_correlation_id,
+                        'code' => $definitelyNotSubmitted ? 'provider_rejected' : 'provider_response_unknown',
+                        'retryable' => $definitelyNotSubmitted, 'error' => $exception->getMessage()],
+                    'occurred_at' => now(),
+                ]);
+            });
 
             EmailActivityUpdated::dispatch($email->fresh());
 
@@ -165,16 +175,17 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
             $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
             $lockedEmail->forceFill([
                 'status' => $lockedEmail->status === 'sending' ? 'sent' : $lockedEmail->status,
-                'ses_message_id' => $result['message_id'],
+                'ses_message_id' => $lockedEmail->ses_message_id ?? $result['message_id'],
                 'sent_at' => now(),
             ])->save();
 
-            $submission->forceFill([
-                'event_type' => 'send',
+            app(EventPublisher::class)->record($lockedEmail, [
+                'event_type' => 'submission_accepted',
                 'ses_message_id' => $result['message_id'],
-                'payload' => $result['response'],
+                'payload' => ['attempt_id' => $submission->submission_correlation_id,
+                    'code' => 'provider_accepted', 'response' => $result['response']],
                 'occurred_at' => now(),
-            ])->save();
+            ]);
         });
 
         app(SesEventNormalizer::class)->reconcile($email->fresh());
@@ -186,7 +197,7 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
      * from the stored message, so every provider must receive recipients out
      * of band — SES as an explicit Destination, SMTP in the envelope.
      *
-     * @return array{from: string, recipients: array<int, string>, to: array<int, string>, cc: array<int, string>, bcc: array<int, string>}
+     * @return array{from: string, recipients: array<int, string>, to: array<int, string>, cc: array<int, string>, bcc: array<int, string>, submission_correlation_id?: string}
      */
     private function envelope(Email $email): array
     {
@@ -209,16 +220,22 @@ class SendQueuedEmail implements ShouldBeUnique, ShouldQueue
             return;
         }
 
-        if (Email::query()->whereKey($email->id)->where('status', 'queued')->update(['status' => 'failed']) !== 1) {
-            return;
-        }
+        DB::transaction(function () use ($email, $exception): void {
+            $lockedEmail = Email::query()->whereKey($email->id)->lockForUpdate()->firstOrFail();
 
-        $email->events()->create([
-            'source_id' => $email->source_id,
-            'event_type' => 'failed',
-            'payload' => ['error' => $exception->getMessage()],
-            'occurred_at' => now(),
-        ]);
+            if ($lockedEmail->status !== 'queued') {
+                return;
+            }
+
+            $lockedEmail->update(['status' => 'failed']);
+            $attempt = $lockedEmail->events()->where('event_type', 'submission_started')->latest('id')->value('submission_correlation_id');
+            app(EventPublisher::class)->record($lockedEmail, [
+                'event_type' => 'failed',
+                'payload' => ['attempt_id' => $attempt, 'code' => 'send_failed', 'final' => true,
+                    'retryable' => false, 'error' => $exception->getMessage()],
+                'occurred_at' => now(),
+            ]);
+        });
 
         EmailActivityUpdated::dispatch($email->fresh());
     }

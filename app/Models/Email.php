@@ -13,10 +13,13 @@ class Email extends Model
 
     public const FILTERABLE_STATUSES = ['delivered', 'opened', 'clicked', 'queued', 'sending', 'bounced', 'complained', 'failed'];
 
+    protected $attributes = ['event_sequence' => 0];
+
     protected $fillable = [
         'public_id',
         'idempotency_key',
         'idempotency_hash',
+        'event_sequence',
         'workspace_id',
         'project_id',
         'source_id',
@@ -43,6 +46,7 @@ class Email extends Model
             'headers' => 'array',
             'tags' => 'array',
             'sent_at' => 'datetime',
+            'event_sequence' => 'integer',
         ];
     }
 

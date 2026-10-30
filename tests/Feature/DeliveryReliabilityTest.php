@@ -124,7 +124,8 @@ it('does not resend or mark failed after an ambiguous provider exception', funct
     $job = new SendQueuedEmail($email->id);
     expect(fn () => $job->handle(app(EmailProviderFactory::class)))->toThrow(RuntimeException::class);
     expect($email->fresh()->status)->toBe('sending');
-    expect($email->events()->where('event_type', 'delivery_uncertain')->sole()->payload['message'])->toContain('before retrying manually');
+    expect($email->events()->where('event_type', 'delivery_uncertain')->sole()->public_event_data['details'])
+        ->toMatchArray(['code' => 'provider_response_unknown', 'retryable' => false]);
     $job->handle(app(EmailProviderFactory::class));
     $job->failed(new RuntimeException('Worker stopped'));
     expect($email->fresh()->status)->toBe('sending');
@@ -304,7 +305,7 @@ it('recovers early SES events and downstream dispatch when the SES id is saved a
     $email = Email::query()->sole();
     $client = Mockery::mock(SesV2Client::class);
     $client->shouldReceive('sendRawEmail')->once()->andReturnUsing(function () use ($source, $email): array {
-        expect($email->events()->where('event_type', 'submission_started')->sole()->payload['message'])->toContain('provider');
+        expect($email->events()->where('event_type', 'submission_started')->sole()->public_event_data['details']['code'])->toBe('submission_started');
         app(SesEventNormalizer::class)->record($source, [
             'eventType' => 'Click', 'mail' => ['messageId' => 'ses-early-1', 'destination' => ['recipient@example.net']],
             'click' => ['timestamp' => now()->toIso8601String(), 'link' => 'https://example.net'],
@@ -316,7 +317,7 @@ it('recovers early SES events and downstream dispatch when the SES id is saved a
     (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class));
     expect($email->fresh()->status)->toBe('clicked')
         ->and($email->events()->where('event_type', 'click')->count())->toBe(1)
-        ->and($email->events()->where('event_type', 'send')->count())->toBe(1);
+        ->and($email->events()->where('event_type', 'submission_accepted')->count())->toBe(1);
 });
 
 it('bounds S3 transport attempts within the worker visibility budget without changing disk selection', function (): void {
@@ -327,16 +328,17 @@ it('bounds S3 transport attempts within the worker visibility budget without cha
         ->and((new SendQueuedEmail(1))->timeout)->toBeLessThan(180);
 });
 
-it('does not fan out the local send marker as another SES provider notification', function (): void {
+it('publishes internal submission outcomes without manufacturing another SES send notification', function (): void {
     [, , $token] = deliveryReliabilityFixture();
     $this->withToken($token)->postJson('/api/emails', deliveryReliabilityPayload())->assertAccepted();
     $email = Email::query()->sole();
     $delivery = Mockery::mock(WebhookDeliveryService::class);
-    $delivery->shouldNotReceive('dispatchFor');
+    $delivery->shouldReceive('dispatchFor')->twice()->withArgs(fn ($event): bool => in_array($event->event_type, ['submission_started', 'submission_accepted'], true));
     $this->app->instance(WebhookDeliveryService::class, $delivery);
     Http::fake(['email.*.amazonaws.com/*' => Http::response(['MessageId' => 'ses-local-marker'])]);
     (new SendQueuedEmail($email->id))->handle(app(EmailProviderFactory::class));
-    expect($email->events()->where('event_type', 'send')->count())->toBe(1);
+    expect($email->events()->where('event_type', 'send')->count())->toBe(0)
+        ->and($email->events()->where('event_type', 'submission_accepted')->count())->toBe(1);
 });
 
 it('retries downstream dispatch after send-result commit without submitting the message again', function (): void {
@@ -350,15 +352,30 @@ it('retries downstream dispatch after send-result commit without submitting the 
     $client = Mockery::mock(SesV2Client::class);
     $client->shouldReceive('sendRawEmail')->once()->andReturn(['message_id' => 'ses-committed-1', 'response' => ['MessageId' => 'ses-committed-1']]);
     $this->app->instance(SesV2Client::class, $client);
+    Exceptions::fake();
+    $outage = new RuntimeException('Queue unavailable after send');
+    $clickIds = [];
     $delivery = Mockery::mock(WebhookDeliveryService::class);
-    $delivery->shouldReceive('dispatchFor')->once()->andThrow(new RuntimeException('Queue unavailable after send'));
-    $delivery->shouldReceive('dispatchFor')->once();
+    $delivery->shouldReceive('dispatchFor')->andReturnUsing(function ($event) use (&$clickIds, $outage): void {
+        if ($event->event_type !== 'click') {
+            return;
+        }
+
+        $clickIds[] = $event->id;
+
+        if (count($clickIds) === 1) {
+            throw $outage;
+        }
+    });
     $this->app->instance(WebhookDeliveryService::class, $delivery);
     $job = new SendQueuedEmail($email->id);
-    expect(fn () => $job->handle(app(EmailProviderFactory::class)))->toThrow(RuntimeException::class, 'Queue unavailable after send');
+    $job->handle(app(EmailProviderFactory::class));
     expect($email->fresh()->status)->toBe('clicked');
     $job->handle(app(EmailProviderFactory::class));
-    expect($email->events()->where('event_type', 'send')->count())->toBe(1);
+    expect($email->events()->where('event_type', 'submission_accepted')->count())->toBe(1)
+        ->and($email->events()->where('event_type', 'click')->count())->toBe(1)
+        ->and(count($clickIds))->toBeGreaterThan(1)->and(array_unique($clickIds))->toHaveCount(1);
+    Exceptions::assertReported(fn (RuntimeException $exception): bool => $exception === $outage);
 });
 
 it('releases the unique lock when a deferred dispatch fails after the outer transaction commits', function (): void {

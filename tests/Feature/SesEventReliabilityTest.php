@@ -8,6 +8,7 @@ use App\Models\User;
 use App\Models\Workspace;
 use App\Services\SesEventNormalizer;
 use App\Services\WebhookDeliveryService;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 
@@ -62,13 +63,15 @@ it('does not downgrade terminal or engagement status for delayed and unordered e
 
 it('retries downstream webhook dispatch after the event was committed before dispatch failed', function (): void {
     [$source, $email] = sesReliabilityFixture();
+    Exceptions::fake();
     $delivery = Mockery::mock(WebhookDeliveryService::class);
     $delivery->shouldReceive('dispatchFor')->once()->andThrow(new RuntimeException('Queue unavailable'));
     $delivery->shouldReceive('dispatchFor')->once()->withArgs(fn (EmailEvent $event): bool => $event->email_id === $email->id);
     $normalizer = new SesEventNormalizer($delivery);
-    expect(fn () => $normalizer->record($source, sesReliabilityPayload('Delivery'), 'sns-recovery'))->toThrow(RuntimeException::class, 'Queue unavailable');
-    $normalizer->record($source, sesReliabilityPayload('Delivery'), 'sns-recovery');
-    expect($email->events()->count())->toBe(1)->and($email->fresh()->status)->toBe('delivered');
+    $first = $normalizer->record($source, sesReliabilityPayload('Delivery'), 'sns-recovery');
+    $second = $normalizer->record($source, sesReliabilityPayload('Delivery'), 'sns-recovery');
+    expect($email->events()->count())->toBe(1)->and($email->fresh()->status)->toBe('delivered')
+        ->and($second->id)->toBe($first->id)->and($second->public_event_data)->toEqual($first->public_event_data);
 });
 
 it('deduplicates fallback payloads independent of object property order', function (): void {

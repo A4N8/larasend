@@ -7,6 +7,7 @@ use App\Exceptions\WebhookDnsResolutionException;
 use App\Models\EmailEvent;
 use App\Models\WebhookDelivery;
 use App\Models\WebhookEndpoint;
+use App\Services\EventEvidence;
 use App\Services\WebhookUrlGuard;
 use GuzzleHttp\Handler\CurlHandler;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -52,7 +53,7 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(WebhookUrlGuard $urlGuard): void
+    public function handle(WebhookUrlGuard $urlGuard, EventEvidence $evidence): void
     {
         $endpoint = WebhookEndpoint::query()->find($this->webhookEndpointId);
         $event = EmailEvent::query()
@@ -63,7 +64,9 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
             return;
         }
 
-        if (! in_array($event->event_type, $endpoint->events ?? [], true)) {
+        $canonical = $evidence->for($event);
+
+        if (! in_array($canonical['type'], $endpoint->events ?? [], true)) {
             return;
         }
 
@@ -71,18 +74,18 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
             return;
         }
 
-        if ($endpoint->deliveries()->where('status', 'ok')->where('payload->id', 'evt_'.$event->id)->exists()) {
+        if ($endpoint->deliveries()->where('status', 'ok')->where('payload->id', $canonical['id'])->exists()) {
             return;
         }
 
-        $payload = $this->payload($event);
+        $payload = $this->payload($event, $canonical);
         $body = json_encode($payload, JSON_THROW_ON_ERROR);
         $startedAt = hrtime(true);
 
         try {
             $requestOptions = $urlGuard->requestOptions($endpoint->url);
         } catch (UnsafeWebhookUrlException|WebhookDnsResolutionException $exception) {
-            $this->recordDelivery($endpoint, $event, $payload, 'fail', null, 0, $exception->getMessage());
+            $this->recordDelivery($endpoint, $payload, 'fail', null, 0, $exception->getMessage());
 
             if ($exception instanceof UnsafeWebhookUrlException) {
                 $endpoint->forceFill(['status' => 'paused'])->save();
@@ -96,7 +99,7 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
         }
 
         try {
-            $response = Http::withHeaders($this->headers($endpoint, $event, $body))
+            $response = Http::withHeaders($this->headers($endpoint, $payload, $body))
                 ->setHandler(new CurlHandler)
                 ->withOptions($requestOptions)
                 ->acceptJson()
@@ -111,7 +114,6 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
 
             $delivery = $this->recordDelivery(
                 endpoint: $endpoint,
-                event: $event,
                 payload: $payload,
                 status: $status,
                 httpStatus: $response->status(),
@@ -129,7 +131,6 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
         } catch (ConnectionException $exception) {
             $this->recordDelivery(
                 endpoint: $endpoint,
-                event: $event,
                 payload: $payload,
                 status: 'fail',
                 httpStatus: null,
@@ -142,16 +143,17 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
     }
 
     /**
+     * @param  array<string, mixed>  $canonical
      * @return array<string, mixed>
      */
-    private function payload(EmailEvent $event): array
+    private function payload(EmailEvent $event, array $canonical): array
     {
         $email = $event->email;
 
         return [
-            'id' => 'evt_'.$event->id,
-            'type' => $event->event_type,
-            'created_at' => $event->occurred_at->toIso8601String(),
+            'id' => $canonical['id'],
+            'type' => $canonical['type'],
+            'created_at' => $canonical['created_at'],
             'data' => [
                 'email' => $email ? [
                     'id' => $email->public_id,
@@ -161,29 +163,24 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
                     'to' => $email->recipients->where('type', 'to')->pluck('email')->values()->all(),
                     'ses_message_id' => $email->ses_message_id,
                 ] : null,
-                'event' => [
-                    'recipient' => $event->recipient,
-                    'url' => $event->url,
-                    'user_agent' => $event->user_agent,
-                    'ip_address' => $event->ip_address,
-                    'payload' => $event->payload,
-                ],
+                'event' => $canonical,
             ],
         ];
     }
 
     /**
+     * @param  array<string, mixed>  $payload
      * @return array<string, string>
      */
-    private function headers(WebhookEndpoint $endpoint, EmailEvent $event, string $body): array
+    private function headers(WebhookEndpoint $endpoint, array $payload, string $body): array
     {
         $timestamp = (string) now()->getTimestamp();
         $signedPayload = $timestamp.'.'.$body;
         $signature = hash_hmac('sha256', $signedPayload, $endpoint->signing_secret);
 
         return [
-            'Larasend-Event-Id' => 'evt_'.$event->id,
-            'Larasend-Event-Type' => $event->event_type,
+            'Larasend-Event-Id' => $payload['id'],
+            'Larasend-Event-Type' => $payload['type'],
             'Larasend-Signature' => "t={$timestamp},v1={$signature}",
             'User-Agent' => 'Larasend-Webhooks/1.0',
         ];
@@ -194,7 +191,6 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
      */
     private function recordDelivery(
         WebhookEndpoint $endpoint,
-        EmailEvent $event,
         array $payload,
         string $status,
         ?int $httpStatus,
@@ -204,7 +200,7 @@ class DeliverWebhook implements ShouldBeUnique, ShouldQueue
         return WebhookDelivery::query()->create([
             'webhook_endpoint_id' => $endpoint->id,
             'public_id' => 'whd_'.Str::lower(Str::random(16)),
-            'event_type' => $event->event_type,
+            'event_type' => $payload['type'],
             'http_status' => $httpStatus,
             'latency_ms' => $latencyMs,
             'status' => $status,

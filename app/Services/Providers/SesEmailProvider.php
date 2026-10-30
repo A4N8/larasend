@@ -87,7 +87,7 @@ class SesEmailProvider implements EmailProvider
             'BccAddresses' => $envelope['bcc'] ?? [],
         ]);
 
-        return $this->sesClient->sendRawEmail($source, $mime, $destination);
+        return $this->sesClient->sendRawEmail($source, $mime, $destination, $envelope['submission_correlation_id'] ?? null);
     }
 
     public function fetchQuota(Source $source): array

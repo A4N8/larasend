@@ -45,7 +45,7 @@ it('retains expired suppressions but blocks only active canonical matches across
     DB::table('suppressions')->where('id', $blocker->id)->update(['email' => ' BLOCK@Example.NET ']);
     $payload = ['from' => 'sender@example.com', 'to' => ['other@example.net'], 'subject' => 'Testing', 'text' => 'Testing', $field => ['Block@example.net']];
 
-    expect(fn () => app(EmailSendService::class)->send($project, $source, $payload))->toThrow(ValidationException::class, 'suppressed recipients');
+    expect(fn () => app(EmailSendService::class)->send($project, $source, $payload))->toThrow(ValidationException::class, 'One or more recipients are suppressed.');
     $blocker->forceFill(['expires_at' => now()])->save();
     app(EmailSendService::class)->send($project, $source, $payload);
 
@@ -68,7 +68,9 @@ it('records every bounce or complaint recipient once while retaining historical 
         ->and($existing->fresh()->expires_at)->toBeNull()
         ->and($existing->fresh()->reason)->toBe($reason)
         ->and($project->suppressions()->where('email', 'second@example.net')->sole()->email_id)->toBe($email->id)
-        ->and(EmailEvent::query()->count())->toBe(1);
+        ->and(EmailEvent::query()->where('event_type', $type)->count())->toBe(1)
+        ->and(EmailEvent::query()->where('event_type', 'suppress')->count())->toBe(2)
+        ->and(EmailEvent::query()->where('event_type', 'suppress')->distinct()->count('id'))->toBe(2);
 })->with([['bounce', 'bouncedRecipients', 'hard_bounce'], ['complaint', 'complainedRecipients', 'complaint']]);
 
 it('reconciles all orphaned bounce recipients and never downgrades an existing complaint', function (): void {

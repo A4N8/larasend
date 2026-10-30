@@ -128,8 +128,8 @@ it('sends queued email through cloudflare smtp with all recipients in the envelo
     expect($email->fresh())
         ->status->toBe('sent')
         ->ses_message_id->toBe($matches[1])
-        ->and($email->events()->where('event_type', 'send')->exists())->toBeTrue()
-        ->and($email->events()->where('event_type', 'send')->first()->payload['provider'])->toBe('cloudflare');
+        ->and($email->events()->where('event_type', 'submission_accepted')->exists())->toBeTrue()
+        ->and($email->events()->where('event_type', 'submission_accepted')->first()->payload['response']['provider'])->toBe('cloudflare');
 });
 
 it('maps cloudflare smtp sender rejections to an actionable setup error', function () {
